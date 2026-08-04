@@ -29,6 +29,107 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.legacy_generation_options import (  # noqa: E402
+    FIGURE_SIZE_TO_IMAGE_SIZE,
+    generation_additional_info,
+)
+
+FIGURE_SIZE_CHOICES = list(FIGURE_SIZE_TO_IMAGE_SIZE)
+DEFAULT_FIGURE_SIZE = "14-17cm"
+DEFAULT_ASPECT_RATIO = "16:9"
+
+# Nominal pixel budget per provider image-size tier. Compared by total area
+# rather than by exact edge length, because the provider does not honour the
+# requested aspect ratio exactly: the one calibration point on this machine,
+# 4k at 16:9, decoded to 5504x3072 (ratio 1.7917, not 1.7778).
+IMAGE_SIZE_EXPECTED_PIXELS = {
+    "1k": 1024 * 1024,
+    "2k": 2048 * 2048,
+    "4k": 4096 * 4096,
+}
+# A decoded image below this fraction of its tier's pixel budget is a material
+# downgrade worth flagging, not provider jitter.
+SIZE_SHORTFALL_FRACTION = 0.75
+# Relative tolerance on the requested aspect ratio.
+ASPECT_RATIO_TOLERANCE = 0.05
+
+
+def build_additional_info(args) -> dict:
+    """Build the per-candidate ``additional_info`` dict from parsed CLI args.
+
+    Routed through the shared helper so both ``figure_size`` and the derived
+    ``image_size`` are populated, exactly as the Gradio UI does.
+    """
+    return generation_additional_info(args.aspect_ratio, args.figure_size)
+
+
+def _nominal_ratio(aspect_ratio: str) -> float | None:
+    try:
+        width, height = (float(part) for part in str(aspect_ratio).split(":"))
+    except (TypeError, ValueError):
+        return None
+    return width / height if height else None
+
+
+def describe_image_dimensions(
+    figure_size: str,
+    image_size: str,
+    aspect_ratio: str,
+    width: int,
+    height: int,
+) -> dict:
+    """Record what was requested against what was actually decoded.
+
+    ``image_size`` is a request, not a guarantee, so a downgrade must never be
+    silent. Returns a slim, JSON-serializable record.
+    """
+    pixels = int(width) * int(height)
+    expected_pixels = IMAGE_SIZE_EXPECTED_PIXELS.get(image_size)
+    size_shortfall = bool(
+        expected_pixels and pixels < expected_pixels * SIZE_SHORTFALL_FRACTION
+    )
+
+    actual_ratio = round(width / height, 4) if width and height else None
+    nominal_ratio = _nominal_ratio(aspect_ratio)
+    aspect_ratio_drift = bool(
+        actual_ratio is not None
+        and nominal_ratio
+        and abs(actual_ratio - nominal_ratio) / nominal_ratio > ASPECT_RATIO_TOLERANCE
+    )
+
+    return {
+        "figure_size": figure_size,
+        "image_size": image_size,
+        "requested_aspect_ratio": aspect_ratio,
+        "width": int(width),
+        "height": int(height),
+        "pixels": pixels,
+        "expected_pixels": expected_pixels,
+        "actual_ratio": actual_ratio,
+        "size_shortfall": size_shortfall,
+        "aspect_ratio_drift": aspect_ratio_drift,
+    }
+
+
+def format_dimension_report(desc: dict, label: str = "") -> str:
+    """Render a dimension record as one human-readable line."""
+    parts = [
+        f"figure_size={desc['figure_size']}",
+        f"image_size={desc['image_size']}",
+        f"requested_ratio={desc['requested_aspect_ratio']}",
+        f"actual={desc['width']}x{desc['height']}",
+    ]
+    if desc["actual_ratio"] is not None:
+        parts.append(f"actual_ratio={desc['actual_ratio']}")
+    if desc["size_shortfall"]:
+        parts.append(
+            "SHORTFALL: decoded image is materially smaller than the requested tier"
+        )
+    if desc["aspect_ratio_drift"]:
+        parts.append("ASPECT-DRIFT: provider did not honour the requested ratio")
+    prefix = f"[dimensions] {label} " if label else "[dimensions] "
+    return prefix + " ".join(parts)
+
 
 def ensure_model_config():
     """Copy model_config.template.yaml to model_config.yaml if missing."""
@@ -131,6 +232,12 @@ async def run(args):
     num_candidates = args.num_candidates
 
     # Build data dicts
+    additional_info = build_additional_info(args)
+    print(
+        f"[config] figure_size={args.figure_size} -> image_size="
+        f"{additional_info.get('image_size', '')} at {args.aspect_ratio}",
+        file=sys.stderr,
+    )
     data_list = []
     for i in range(num_candidates):
         data_list.append({
@@ -138,7 +245,7 @@ async def run(args):
             "caption": args.caption,
             "content": content,
             "visual_intent": args.caption,
-            "additional_info": {"rounded_ratio": args.aspect_ratio},
+            "additional_info": dict(additional_info),
             "max_critic_rounds": args.max_critic_rounds,
         })
 
@@ -181,11 +288,21 @@ async def run(args):
         img.save(str(save_path), format="PNG")
         saved_paths.append(str(save_path))
 
+        width, height = img.size
+        desc = describe_image_dimensions(
+            args.figure_size,
+            additional_info.get("image_size", ""),
+            args.aspect_ratio,
+            width,
+            height,
+        )
+        print(format_dimension_report(desc, label=save_path.name), file=sys.stderr)
+
     for p in saved_paths:
         print(p)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="PaperBanana Skill: generate academic diagrams/plots from text"
     )
@@ -200,9 +317,14 @@ def main():
                         help="Task type: diagram or plot")
     parser.add_argument("--output", type=str, default="output.png",
                         help="Output image path (default: output.png)")
-    parser.add_argument("--aspect-ratio", type=str, default="21:9",
+    parser.add_argument("--aspect-ratio", type=str, default=DEFAULT_ASPECT_RATIO,
                         choices=["21:9", "16:9", "3:2"],
-                        help="Aspect ratio (default: 21:9)")
+                        help=f"Aspect ratio (default: {DEFAULT_ASPECT_RATIO})")
+    parser.add_argument("--figure-size", type=str, default=DEFAULT_FIGURE_SIZE,
+                        choices=FIGURE_SIZE_CHOICES,
+                        help="Target printed figure width; maps to the provider "
+                             "image-size tier (1-3cm/4-6cm -> 1k, 7-9cm/10-13cm -> 2k, "
+                             f"14-17cm -> 4k). Default: {DEFAULT_FIGURE_SIZE} (4k)")
     parser.add_argument("--max-critic-rounds", type=int, default=3,
                         help="Max critic refinement rounds (default: 3)")
     parser.add_argument("--num-candidates", type=int, default=10,
@@ -220,7 +342,11 @@ def main():
                         choices=["demo_full", "demo_planner_critic"],
                         help="Pipeline mode: demo_full (Retriever+Planner+Stylist+Visualizer+Critic) or demo_planner_critic (Retriever+Planner+Visualizer+Critic, no Stylist) (default: demo_full)")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     asyncio.run(run(args))
 
 
