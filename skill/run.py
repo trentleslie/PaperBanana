@@ -23,6 +23,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -75,6 +76,28 @@ ELIDED_PAYLOAD = "<elided: base64 image payload>"
 # through: the smallest images the pipeline emits are several KB base64.
 BASE64_VALUE_MIN_LENGTH = 512
 _BASE64_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
+
+# Candidate error strings are the one free-text channel into the manifest whose
+# content the allowlist does not control: they come verbatim from third-party SDK
+# exceptions, which are known to echo the key they were called with. The manifest
+# is meant to be kept indefinitely, so that text is redacted before it is stored.
+CREDENTIAL_ENV_VARS = (
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+)
+REDACTED_CREDENTIAL = "<redacted: credential>"
+# Shapes, not names: an unknown provider's key still gets caught.
+_KEY_SHAPED_RE = re.compile(
+    r"(?:sk-[A-Za-z0-9_\-]{16,}|AIza[A-Za-z0-9_\-]{20,}|ya29\.[A-Za-z0-9_\-]{16,})"
+)
+
+# A failure the processor could not attribute to any requested candidate. Kept
+# distinct from seed_manifest_entries' 'unidentified_candidate_<index>', which
+# names a *requested* candidate whose own filename was unusable.
+UNATTRIBUTED_FAILURE_PREFIX = "unattributed_failure_"
 
 
 def build_additional_info(args) -> dict:
@@ -176,7 +199,9 @@ def ensure_dataset(task_name: str):
         print("ERROR: huggingface_hub is required for automatic dataset download.\n"
               "Install it with: pip install huggingface_hub", file=sys.stderr)
         sys.exit(1)
-    print(f"Downloading PaperBananaBench/{task_name} from HuggingFace...")
+    # Status, not output: stdout belongs to the image paths alone.
+    print(f"Downloading PaperBananaBench/{task_name} from HuggingFace...",
+          file=sys.stderr)
     snapshot_download(
         "dwzhu/PaperBananaBench",
         repo_type="dataset",
@@ -404,6 +429,52 @@ def scrub_payloads(value):
     return value
 
 
+def configured_credential_values() -> list[str]:
+    """Every credential value this process could actually have used.
+
+    Both surfaces R7a names are covered: the environment, and the ``api_keys``
+    section of ``configs/model_config.yaml``. Read defensively; a manifest must
+    never fail to be written because a config file is malformed.
+    """
+    values = []
+    for name in CREDENTIAL_ENV_VARS:
+        value = os.environ.get(name) or ""
+        if len(value) >= 8:
+            values.append(value)
+
+    config_path = PROJECT_ROOT / "configs" / "model_config.yaml"
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        for value in (loaded.get("api_keys") or {}).values():
+            if isinstance(value, str) and len(value) >= 8:
+                values.append(value)
+    except Exception:  # noqa: BLE001 - never let redaction sourcing break a run
+        pass
+    return values
+
+
+def redact_credentials(text) -> str:
+    """Mask credential material in text this module did not author."""
+    text = str(text)
+    for value in configured_credential_values():
+        text = text.replace(value, REDACTED_CREDENTIAL)
+    return _KEY_SHAPED_RE.sub(REDACTED_CREDENTIAL, text)
+
+
+def unattributed_failure_key(entries: dict) -> str:
+    """A distinct key per unattributable failure.
+
+    A bare shared key would let a second unattributable failure overwrite the
+    first one's error, and would collide with a seeded candidate name.
+    """
+    index = 0
+    while f"{UNATTRIBUTED_FAILURE_PREFIX}{index}" in entries:
+        index += 1
+    return f"{UNATTRIBUTED_FAILURE_PREFIX}{index}"
+
+
 def build_candidate_trace(result: dict, exp_mode: str) -> list[dict]:
     """Per-candidate reasoning trace, built from the shared UI stage helper."""
     from utils.legacy_ui_results import build_evolution_stages
@@ -504,7 +575,7 @@ def record_result(result, entries: dict, **save_kwargs) -> dict:
 
 def record_failure(identity, entries: dict, error) -> dict:
     """Fold a raised candidate into the entries without aborting the batch."""
-    identity = identity or "unidentified_candidate"
+    identity = identity or unattributed_failure_key(entries)
     entry = entries.setdefault(
         identity,
         {
@@ -517,8 +588,8 @@ def record_failure(identity, entries: dict, error) -> dict:
         },
     )
     entry["status"] = "failed"
-    entry["error"] = str(error)
-    print(f"WARNING: candidate {identity} failed: {error}", file=sys.stderr)
+    entry["error"] = redact_credentials(error)
+    print(f"WARNING: candidate {identity} failed: {entry['error']}", file=sys.stderr)
     return entry
 
 
@@ -558,6 +629,7 @@ def build_manifest(
     args,
     additional_info: dict,
     entries: dict,
+    candidates_requested: int,
     content: str,
     resolved_models: dict,
     image_gen_backend: str,
@@ -568,7 +640,14 @@ def build_manifest(
     """Assemble the run record from an explicit allowlist.
 
     Credential material is excluded by construction rather than by filtering:
-    nothing is copied wholesale from args, config, or the result dicts.
+    nothing is copied wholesale from args, config, or the result dicts. The one
+    exception is ``candidates[].error``, third-party text this module does not
+    author, which is redacted on the way in.
+
+    ``candidates_requested`` is passed in rather than read off ``entries``:
+    ``record_failure`` can add an entry for a failure that could not be attributed
+    to any requested candidate, and such an entry must not inflate the count of
+    what was asked for.
     """
     content = content or ""
     return {
@@ -577,7 +656,7 @@ def build_manifest(
             "status": run_status(entries),
             "started_at": started_at,
             "finished_at": finished_at,
-            "candidates_requested": len(entries),
+            "candidates_requested": candidates_requested,
             "candidates_succeeded": sum(
                 1 for entry in entries.values() if entry.get("status") == "succeeded"
             ),
@@ -639,6 +718,10 @@ def quiet_pipeline_stdout():
     38 print() calls sit on the run path across paperviz_processor,
     visualizer_agent and generation_utils. Without this the published
     'stdout is image paths, one per line' contract is false.
+
+    It has to cover the whole run, not just the drain: the earliest of those
+    prints fire at *import* time (``utils.generation_utils`` announces every
+    configured client from module scope), before any candidate exists.
     """
     with contextlib.redirect_stdout(sys.stderr):
         yield
@@ -654,10 +737,42 @@ def emit_results(entries: dict, manifest_path) -> None:
 
 
 async def run(args):
+    """Entry point: run the pipeline quietly, then emit the results.
+
+    Split in two so the guarantee is structural. Everything that can print lives
+    inside ``_execute_run`` under the redirect; the only writes to the real stdout
+    come from the single ``emit_results`` call below, which is in a ``finally`` so
+    images already on disk are still announced when the pipeline dies mid-run.
+    """
+    entries: dict = {}
+    outcome: dict = {"manifest": None, "manifest_path": None}
+    try:
+        with quiet_pipeline_stdout():
+            await _execute_run(args, entries, outcome)
+    finally:
+        emit_results(entries, outcome["manifest_path"])
+
+    manifest = outcome["manifest"]
+    if manifest is not None and manifest["run"]["status"] == "failed":
+        print(
+            "ERROR: no candidate produced an image; see the manifest for details.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+async def _execute_run(args, entries: dict, outcome: dict) -> None:
+    """The run itself, with stdout redirected to stderr for its whole duration.
+
+    ``entries`` and ``outcome`` are filled in place rather than returned, so the
+    caller can emit whatever survived even if this raises.
+    """
     ensure_model_config()
     ensure_dataset(args.task)
 
-    # Late imports so env is ready
+    # Late imports so env is ready. These are inside the redirect on purpose:
+    # importing utils.generation_utils prints one 'Initialized <Provider> Client'
+    # line per configured key, straight to stdout.
     from agents.planner_agent import PlannerAgent
     from agents.visualizer_agent import VisualizerAgent
     from agents.stylist_agent import StylistAgent
@@ -730,7 +845,8 @@ async def run(args):
 
     # Seed one entry per *requested* candidate before draining anything, so a
     # run that dies part-way is evaluated against what was asked for.
-    entries = seed_manifest_entries(data_list)
+    entries.update(seed_manifest_entries(data_list))
+    candidates_requested = len(entries)
     save_kwargs = {
         "exp_mode": exp_mode,
         "output_path": output_path,
@@ -742,23 +858,21 @@ async def run(args):
     }
 
     started_at = _utc_timestamp()
-    manifest_path = None
     try:
-        # Pipeline chatter goes to stderr so stdout stays parseable.
-        with quiet_pipeline_stdout():
-            await drain_batch(
-                processor.process_queries_batch(
-                    data_list, max_concurrent=num_candidates, do_eval=False
-                ),
-                entries,
-                **save_kwargs,
-            )
+        await drain_batch(
+            processor.process_queries_batch(
+                data_list, max_concurrent=num_candidates, do_eval=False
+            ),
+            entries,
+            **save_kwargs,
+        )
     finally:
         # Single emitter, reached on every exit path.
         manifest = build_manifest(
             args=args,
             additional_info=additional_info,
             entries=entries,
+            candidates_requested=candidates_requested,
             content=content,
             resolved_models={
                 "main_model_name": exp_config.main_model_name,
@@ -773,15 +887,8 @@ async def run(args):
             finished_at=_utc_timestamp(),
         )
         manifest_path = write_manifest(manifest_path_for(output_path), manifest)
-
-    emit_results(entries, manifest_path)
-
-    if manifest["run"]["status"] == "failed":
-        print(
-            "ERROR: no candidate produced an image; see the manifest for details.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        outcome["manifest"] = manifest
+        outcome["manifest_path"] = manifest_path
 
 
 def build_parser() -> argparse.ArgumentParser:

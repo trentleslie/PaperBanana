@@ -215,6 +215,7 @@ class DrainBatchTests(unittest.IsolatedAsyncioTestCase):
             args=args_namespace(num_candidates=3),
             additional_info={"rounded_ratio": "16:9", "figure_size": "14-17cm", "image_size": "4k"},
             entries=entries,
+            candidates_requested=len(data_list),
             content="method text",
             resolved_models={"main_model_name": "m", "image_gen_model_name": "i"},
             image_gen_backend="gemini",

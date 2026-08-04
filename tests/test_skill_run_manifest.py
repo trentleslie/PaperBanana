@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from argparse import Namespace
 from pathlib import Path
 
@@ -245,13 +246,21 @@ class ManifestBuildTests(unittest.TestCase):
             args=args,
             additional_info={"rounded_ratio": "16:9", "figure_size": "14-17cm", "image_size": "4k"},
             entries=entries,
+            # What was asked for, fixed at seeding time and never re-read off the
+            # entries dict, which record_failure can grow.
+            candidates_requested=len(data_list),
             content="method text",
             resolved_models={
                 "main_model_name": "gemini-3.1-pro-preview",
                 "image_gen_model_name": "gemini-3.1-flash-image-preview",
             },
             image_gen_backend="gemini",
-            retrieval={"top10_references_count": 0, "retrieved_examples_count": 0},
+            retrieval={
+                "setting": "auto",
+                "top10_references_count": 0,
+                "retrieved_examples_count": 0,
+                "top10_references": [],
+            },
             started_at="2026-08-04T10:15:00Z",
             finished_at="2026-08-04T10:38:00Z",
         )
@@ -334,7 +343,26 @@ class ManifestBuildTests(unittest.TestCase):
         self.assertNotIn(SENTINEL_KEY, json.dumps(manifest))
 
     def test_manifest_is_orders_of_magnitude_smaller_than_the_ui_output(self) -> None:
-        results = [full_result(f"skill_candidate_{i}", critic_rounds=3) for i in range(10)]
+        """Payload-sized, so the size assertion is not vacuous.
+
+        Toy 8x8 PNGs total ~12KB across ten candidates, three orders of magnitude
+        under the threshold: a regression that copied every payload verbatim would
+        still have passed. The description fields are the channel that reaches the
+        manifest verbatim, so each carries a realistic payload here.
+        """
+        results = []
+        payload_bytes = 0
+        for i in range(10):
+            result = full_result(f"skill_candidate_{i}", critic_rounds=3)
+            # A stage image's worth of base64, parked on the text fields the
+            # manifest copies. Only the value-based scrub can catch these.
+            for key in ("target_diagram_desc0", "target_diagram_stylist_desc0"):
+                result[key] = long_base64_blob(150_000)
+                payload_bytes += len(result[key])
+            results.append(result)
+
+        self.assertGreater(payload_bytes, 3_000_000)
+
         _, manifest, output_path = self.build(results, num_candidates=10)
 
         path = skill_run.write_manifest(skill_run.manifest_path_for(output_path), manifest)
@@ -370,6 +398,180 @@ class ManifestBuildTests(unittest.TestCase):
 
         self.assertTrue(path.exists())
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["run"]["status"], "complete")
+
+
+class UnattributedFailureTests(unittest.TestCase):
+    """A failure the processor could not pin on a candidate is not a candidate.
+
+    paperviz_processor yields ``filename: None`` when it cannot attribute a raised
+    exception (the ``failed_index is None`` fallback), so run.py has to fold in a
+    record that belongs to no requested candidate.
+    """
+
+    def test_it_does_not_inflate_the_count_of_what_was_requested(self) -> None:
+        data_list = [{"filename": f"skill_candidate_{i}"} for i in range(10)]
+        entries = skill_run.seed_manifest_entries(data_list)
+        requested = len(entries)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            skill_run.record_failure(None, entries, RuntimeError("unattributable"))
+
+        self.assertEqual(len(entries), 11)
+        manifest = skill_run.build_manifest(
+            args=args_namespace(num_candidates=10),
+            additional_info={},
+            entries=entries,
+            candidates_requested=requested,
+            content="method text",
+            resolved_models={},
+            image_gen_backend="gemini",
+            retrieval={},
+            started_at="2026-08-04T10:15:00Z",
+            finished_at="2026-08-04T10:38:00Z",
+        )
+
+        self.assertEqual(manifest["run"]["candidates_requested"], 10)
+        self.assertEqual(len(manifest["candidates"]), 11)
+
+    def test_two_unattributed_failures_do_not_overwrite_each_other(self) -> None:
+        entries = skill_run.seed_manifest_entries([{"filename": "skill_candidate_0"}])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            skill_run.record_failure(None, entries, RuntimeError("first boom"))
+            skill_run.record_failure(None, entries, RuntimeError("second boom"))
+
+        errors = [e["error"] for e in entries.values() if e["status"] == "failed"]
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any("first boom" in e for e in errors))
+        self.assertTrue(any("second boom" in e for e in errors))
+
+    def test_its_key_cannot_collide_with_a_seeded_identity_less_candidate(self) -> None:
+        """seed_manifest_entries names those 'unidentified_candidate_<index>'."""
+        entries = skill_run.seed_manifest_entries([{"filename": None}, {"filename": ""}])
+        self.assertIn("unidentified_candidate_0", entries)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            skill_run.record_failure(None, entries, RuntimeError("boom"))
+
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries["unidentified_candidate_0"]["status"], "missing")
+
+
+class ErrorTextRedactionTests(unittest.TestCase):
+    """candidates[].error is third-party text, not allowlisted values.
+
+    Provider SDKs are known to echo the key they were called with, and the
+    manifest is meant to be kept indefinitely.
+    """
+
+    def test_a_key_shaped_secret_in_an_exception_never_reaches_the_manifest(self) -> None:
+        entries = skill_run.seed_manifest_entries([{"filename": "skill_candidate_0"}])
+        error = RuntimeError(
+            f"400 INVALID_ARGUMENT: API key not valid: {SENTINEL_KEY} (key=sk-or-v1-abcdefghijklmnop1234)"
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            skill_run.record_failure("skill_candidate_0", entries, error)
+
+        manifest = skill_run.build_manifest(
+            args=args_namespace(num_candidates=1),
+            additional_info={},
+            entries=entries,
+            candidates_requested=1,
+            content="method text",
+            resolved_models={},
+            image_gen_backend="gemini",
+            retrieval={},
+            started_at="2026-08-04T10:15:00Z",
+            finished_at="2026-08-04T10:38:00Z",
+        )
+
+        serialized = json.dumps(manifest)
+        self.assertNotIn(SENTINEL_KEY, serialized)
+        self.assertNotIn("sk-or-v1-abcdefghijklmnop1234", serialized)
+        self.assertNotIn(SENTINEL_KEY, err.getvalue())
+        # The diagnosis survives the redaction.
+        self.assertIn("INVALID_ARGUMENT", entries["skill_candidate_0"]["error"])
+
+    def test_the_configured_environment_key_is_redacted_by_value(self) -> None:
+        """Catches a key whose shape no pattern anticipates."""
+        secret = "totally-unpatterned-key-value-9182"
+        with unittest.mock.patch.dict(os.environ, {"GOOGLE_API_KEY": secret}):
+            redacted = skill_run.redact_credentials(f"401 Unauthorized for key {secret}")
+
+        self.assertNotIn(secret, redacted)
+        self.assertIn(skill_run.REDACTED_CREDENTIAL, redacted)
+
+    def test_a_key_from_model_config_yaml_is_redacted_by_value(self) -> None:
+        """R7a names configs/model_config.yaml explicitly as a surface."""
+        with tempfile.TemporaryDirectory() as tmp:
+            configs = Path(tmp) / "configs"
+            configs.mkdir()
+            (configs / "model_config.yaml").write_text(
+                f'api_keys:\n  google_api_key: "{SENTINEL_KEY}"\n', encoding="utf-8"
+            )
+            with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", Path(tmp)):
+                redacted = skill_run.redact_credentials(
+                    f"PermissionDenied: key {SENTINEL_KEY} lacks access"
+                )
+
+        self.assertNotIn(SENTINEL_KEY, redacted)
+
+    def test_a_malformed_config_file_does_not_break_redaction(self) -> None:
+        """A manifest must still be written when the config cannot be parsed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            configs = Path(tmp) / "configs"
+            configs.mkdir()
+            (configs / "model_config.yaml").write_text("{[not: yaml", encoding="utf-8")
+            with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", Path(tmp)):
+                self.assertEqual(skill_run.redact_credentials("plain error"), "plain error")
+
+    def test_ordinary_error_text_is_left_alone(self) -> None:
+        self.assertEqual(
+            skill_run.redact_credentials("RuntimeError: visualizer exhausted retries"),
+            "RuntimeError: visualizer exhausted retries",
+        )
+
+
+class RetrievalRecordTests(unittest.TestCase):
+    """Retrieval runs once per batch, and is recorded once per run.
+
+    The record reads data_list[0] because retriever_agent mutates that dict in
+    place; with --num-candidates 1 there is nothing else it could read.
+    """
+
+    def test_it_records_the_setting_and_the_shared_retrieval_result(self) -> None:
+        data_list = [
+            {"filename": "skill_candidate_0",
+             "top10_references": [{"paper": "a"}, {"paper": "b"}],
+             "retrieved_examples": [{"image": "x"}]},
+            {"filename": "skill_candidate_1"},
+        ]
+
+        record = skill_run.build_retrieval_record(data_list, "auto")
+
+        self.assertEqual(record["setting"], "auto")
+        self.assertEqual(record["top10_references_count"], 2)
+        self.assertEqual(record["retrieved_examples_count"], 1)
+        self.assertEqual(record["top10_references"], [{"paper": "a"}, {"paper": "b"}])
+
+    def test_retrieval_disabled_is_recorded_as_such_rather_than_omitted(self) -> None:
+        record = skill_run.build_retrieval_record([{"filename": "skill_candidate_0"}], "none")
+
+        self.assertEqual(record["setting"], "none")
+        self.assertEqual(record["top10_references_count"], 0)
+        self.assertEqual(record["retrieved_examples_count"], 0)
+
+    def test_an_empty_data_list_does_not_raise(self) -> None:
+        self.assertEqual(skill_run.build_retrieval_record([], "auto")["setting"], "auto")
+
+    def test_a_payload_smuggled_into_a_reference_is_elided(self) -> None:
+        blob = long_base64_blob()
+        record = skill_run.build_retrieval_record(
+            [{"top10_references": [{"caption": blob}]}], "auto"
+        )
+
+        self.assertNotIn(blob, json.dumps(record))
 
 
 class StdoutContractTests(unittest.TestCase):

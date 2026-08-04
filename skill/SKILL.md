@@ -102,9 +102,17 @@ image and the Nth manifest entry always describe the same candidate.
 ## Output
 
 **Stdout contract:** stdout carries the absolute path of each saved image, one
-per line, and nothing else. Pipeline progress, warnings, dimension reports and
-the manifest path all go to stderr. Piping stdout to a naive line reader yields
-only image paths.
+per line, and nothing else. Pipeline progress, warnings, dimension reports, the
+dataset-download banner, the client-initialisation banners and the manifest path
+all go to stderr. Piping stdout to a naive line reader yields only image paths.
+
+This is enforced structurally rather than declared: the CLI redirects Python's
+stdout to stderr for the whole run, from before the first pipeline import — the
+client banners print at import time — and writes the image paths afterwards, from
+one place. The paths are emitted even when the run dies part-way, so a caller is
+never left with images on disk it was not told about. The one thing outside this
+guarantee is output written straight to file descriptor 1 by a subprocess or a C
+extension, which no Python-level redirect can capture.
 
 ### Run manifest
 
@@ -122,12 +130,21 @@ reasoning trace.
 
 It never contains credential material: it is assembled from an explicit
 allowlist of already-resolved values, and base64 image payloads are stripped, so
-a manifest stays small enough to keep indefinitely.
+a manifest stays small enough to keep indefinitely. The one field whose text this
+CLI does not author is `candidates[].error`, which comes verbatim from a provider
+SDK exception; key-shaped substrings and the values of the configured API keys are
+redacted from it before it is stored.
 
 Candidate statuses distinguish `succeeded`, `no_image` (the candidate finished
 but produced nothing), `failed` (the candidate raised) and `missing` (the
 candidate never returned). A failing candidate no longer aborts the batch: the
 surviving images are still written, and the manifest states what was lost.
+
+`run.candidates_requested` counts the candidates the run asked for, fixed before
+anything is drained. A failure the pipeline cannot attribute to any specific
+candidate is recorded as an extra `unattributed_failure_<n>` entry alongside the
+requested ones, so it never inflates that count and never masks the candidate
+that actually went missing.
 
 ## Examples
 
