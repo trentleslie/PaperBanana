@@ -250,7 +250,13 @@ class PaperVizProcessor:
                         "filename": identity,
                         "candidate_error": f"{type(error).__name__}: {error}",
                     }
-                    print(f"[Batch] Candidate {identity} failed: {result_data['candidate_error']}")
+                    # The exception *type* only. The message is verbatim
+                    # third-party SDK text, and provider SDKs are known to echo
+                    # the key they were called with; printing it here would put
+                    # a live credential on the operator's log before the caller
+                    # ever gets the chance to redact it. The caller announces
+                    # the redacted detail (skill/run.py:record_failure).
+                    print(f"[Batch] Candidate {identity} failed: {type(error).__name__}")
                 all_result_list.append(result_data)
                 postfix_dict = {}
 

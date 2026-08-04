@@ -12,8 +12,10 @@ while draining. No provider is contacted and no image model is called.
 """
 
 import contextlib
+import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -259,6 +261,119 @@ class RunEntryPointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retrieval["setting"], "auto")
         self.assertEqual(retrieval["top10_references_count"], 2)
         self.assertEqual(retrieval["retrieved_examples_count"], 1)
+
+
+    async def test_content_file_is_read_and_embedded_in_the_manifest(self) -> None:
+        """--content-file is the documented alternative to --content.
+
+        Reproducibility rests on the file's *text* being embedded, not pinned by
+        a path that can later be edited or moved, so the read itself has to be
+        exercised end to end.
+        """
+        content_path = self.tmp / "method.md"
+        content_path.write_text("method text from a file", encoding="utf-8")
+        seen = []
+
+        async def batch(data_list):
+            seen.extend(data["content"] for data in data_list)
+            for data in data_list:
+                yield full_result(data["filename"])
+
+        await self.execute(
+            batch,
+            self.args(num_candidates=1, content="", content_file=str(content_path)),
+        )
+
+        self.assertEqual(seen, ["method text from a file"])
+        manifest = self.manifest()
+        self.assertEqual(manifest["input"]["content"], "method text from a file")
+        self.assertEqual(manifest["input"]["content_file"], str(content_path))
+        self.assertEqual(
+            manifest["input"]["content_sha256"],
+            hashlib.sha256(b"method text from a file").hexdigest(),
+        )
+
+    async def test_a_relative_output_is_emitted_as_an_absolute_path(self) -> None:
+        """SKILL.md publishes absolute paths on stdout.
+
+        A downstream caller consuming stdout from another working directory has
+        nothing else to go on, so the resolution cannot be left to the caller's
+        cwd happening to match.
+        """
+        async def batch(data_list):
+            for data in data_list:
+                yield full_result(data["filename"])
+
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, cwd)
+
+        out, _ = await self.execute(
+            batch, self.args(num_candidates=1, output="figs/figure.png")
+        )
+
+        lines = [line for line in out.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(Path(lines[0]).is_absolute(), f"not absolute: {lines[0]!r}")
+        self.assertTrue(Path(lines[0]).is_file())
+        self.assertEqual(
+            Path(lines[0]).parent.resolve(), (self.tmp / "figs").resolve()
+        )
+
+    async def test_an_unwritable_output_fails_before_any_candidate_is_generated(self) -> None:
+        """Seconds, not 10-30 minutes of paid generation, then a PermissionError."""
+        readonly = self.tmp / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        self.addCleanup(readonly.chmod, 0o700)
+        started = []
+
+        async def batch(data_list):
+            started.append(True)
+            for data in data_list:
+                yield full_result(data["filename"])
+
+        out, err = io.StringIO(), io.StringIO()
+        with stubbed_pipeline(batch):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    await skill_run.run(
+                        self.args(output=str(readonly / "figs" / "figure.png"))
+                    )
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(started, [], "the pipeline ran against an unusable output")
+        self.assertEqual(out.getvalue().strip(), "")
+        self.assertIn("not writable", err.getvalue())
+
+
+class ParserValidationTests(unittest.TestCase):
+    BASE = ["--content", "method text", "--caption", "Figure 1: overview"]
+
+    def test_num_candidates_below_one_is_refused_at_parse_time(self) -> None:
+        """A zero-candidate run stamped itself 'failed' and exited 1 for
+        producing nothing it was never asked to produce."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                skill_run.build_parser().parse_args(
+                    self.BASE + ["--num-candidates", "0"]
+                )
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("at least 1", err.getvalue())
+
+    def test_a_negative_count_is_refused_too(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                skill_run.build_parser().parse_args(
+                    self.BASE + ["--num-candidates", "-3"]
+                )
+
+    def test_a_positive_count_still_parses(self) -> None:
+        args = skill_run.build_parser().parse_args(self.BASE + ["--num-candidates", "3"])
+
+        self.assertEqual(args.num_candidates, 3)
 
 
 class DatasetBannerTests(unittest.TestCase):

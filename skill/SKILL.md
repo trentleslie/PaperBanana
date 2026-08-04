@@ -58,6 +58,12 @@ With `--output` omitted, images and the run manifest are written to a fresh
 timestamped directory under `results/skill_runs/`, so a repeat invocation cannot
 destroy a prior run. Pass `--output path/to/figure.png` to control placement.
 
+The destination is created and write-probed before the pipeline starts, so an
+unusable `--output` fails in seconds with exit code 2 rather than after a 10-30
+minute paid run. If the destination becomes unwritable during the run, the
+manifest falls back to a fresh `results/skill_runs/` directory rather than being
+lost with the images.
+
 ## Parameters
 
 | Parameter | Required | Default | Description |
@@ -70,7 +76,7 @@ destroy a prior run. Pass `--output path/to/figure.png` to control placement.
 | `--aspect-ratio` | No | `16:9` | Aspect ratio: `21:9`, `16:9`, or `3:2` |
 | `--figure-size` | No | `14-17cm` | Target printed figure width, which sets the provider render resolution: `1-3cm` and `4-6cm` → `1k`, `7-9cm` and `10-13cm` → `2k`, `14-17cm` → `4k` |
 | `--max-critic-rounds` | No | `3` | Maximum critic refinement iterations |
-| `--num-candidates` | No | `10` | Number of parallel candidates to generate |
+| `--num-candidates` | No | `10` | Number of parallel candidates to generate. Must be at least 1; `0` is rejected at parse time rather than producing a run that reports itself failed for generating nothing |
 | `--retrieval-setting` | No | `auto` | Retrieval mode: `auto`, `manual`, `random`, or `none` |
 | `--planner-metaphor` | No | off | Flag. Diagram-only Planner visual-metaphor discovery before the detailed description is produced |
 | `--main-model-name` | No | `gemini-3.1-pro-preview` | Main model for VLM agents. Provider auto-detected from configured API key |
@@ -138,7 +144,10 @@ redacted from it before it is stored.
 Candidate statuses distinguish `succeeded`, `no_image` (the candidate finished
 but produced nothing), `failed` (the candidate raised) and `missing` (the
 candidate never returned). A failing candidate no longer aborts the batch: the
-surviving images are still written, and the manifest states what was lost.
+surviving images are still written, and the manifest states what was lost. That
+holds on both sides of the stream — a candidate that raises while being
+generated, and a candidate that raises while being written to disk, are both
+recorded as that one candidate's failure.
 
 `run.candidates_requested` counts the candidates the run asked for, fixed before
 anything is drained. A failure the pipeline cannot attribute to any specific

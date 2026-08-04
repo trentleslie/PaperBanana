@@ -75,7 +75,12 @@ ELIDED_PAYLOAD = "<elided: base64 image payload>"
 # Long enough that prose never trips it, short enough that no real payload slips
 # through: the smallest images the pipeline emits are several KB base64.
 BASE64_VALUE_MIN_LENGTH = 512
-_BASE64_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
+# Newlines are allowed because providers line-wrap base64; a space or a tab is
+# not, because that is the one character that separates payloads from prose.
+# Without that rule any long punctuation-free sentence was elided as a payload,
+# silently destroying real planner and critic reasoning text.
+_BASE64_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]+$")
+_PROSE_SEPARATOR_RE = re.compile(r"[ \t]")
 
 # Candidate error strings are the one free-text channel into the manifest whose
 # content the allowlist does not control: they come verbatim from third-party SDK
@@ -411,6 +416,9 @@ def looks_like_base64_payload(value) -> bool:
         return True
     if len(text) < BASE64_VALUE_MIN_LENGTH:
         return False
+    # Prose separates its words with spaces; base64 never does.
+    if _PROSE_SEPARATOR_RE.search(text):
+        return False
     return bool(_BASE64_VALUE_RE.match(text))
 
 
@@ -599,16 +607,32 @@ def is_error_record(result) -> bool:
 
 
 async def drain_batch(result_stream, entries: dict, **save_kwargs) -> None:
-    """Drain the batch, folding both successes and failures into the entries."""
+    """Drain the batch, folding both successes and failures into the entries.
+
+    The producer-side guard in ``process_queries_batch`` is only half of "a
+    failing candidate cannot destroy the batch". An exception raised *here* --
+    an undecodable payload, a save that fails -- escapes the ``async for``,
+    which closes the generator and cancels every undrained candidate, throwing
+    away a paid run that had already finished computing. So each result is
+    folded in under its own guard and a raise becomes that candidate's failure,
+    not the batch's.
+    """
     async for result_data in result_stream:
-        if is_error_record(result_data):
+        try:
+            if is_error_record(result_data):
+                record_failure(
+                    candidate_identity(result_data),
+                    entries,
+                    result_data.get("candidate_error"),
+                )
+            else:
+                record_result(result_data, entries, **save_kwargs)
+        except Exception as exc:  # noqa: BLE001 - one candidate, not the batch
             record_failure(
                 candidate_identity(result_data),
                 entries,
-                result_data.get("candidate_error"),
+                f"{type(exc).__name__}: {exc}",
             )
-        else:
-            record_result(result_data, entries, **save_kwargs)
 
 
 def build_retrieval_record(data_list, setting: str | None = None) -> dict:
@@ -700,8 +724,7 @@ def build_manifest(
     }
 
 
-def write_manifest(manifest_path: Path, manifest: dict) -> Path:
-    """The single emitter. Every exit path routes through here."""
+def _emit_manifest_file(manifest_path: Path, manifest: dict) -> Path:
     manifest_path = Path(manifest_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
@@ -709,6 +732,69 @@ def write_manifest(manifest_path: Path, manifest: dict) -> Path:
         encoding="utf-8",
     )
     return manifest_path
+
+
+def write_manifest(manifest_path: Path, manifest: dict) -> Path | None:
+    """The single emitter. Every exit path routes through here.
+
+    Falls back to a fresh run directory when the requested destination cannot be
+    written. The requested destination is exactly the one whose unwritability
+    would have caused the run to fail in the first place, so writing the record
+    of a 10-30 minute paid run there and nowhere else loses it precisely when it
+    matters most. Returns None only when even the fallback is unavailable, so a
+    manifest failure can never mask the run's own outcome.
+    """
+    try:
+        return _emit_manifest_file(manifest_path, manifest)
+    except OSError as exc:
+        print(
+            f"WARNING: could not write the manifest to {manifest_path} ({exc}); "
+            "falling back to a fresh run directory.",
+            file=sys.stderr,
+        )
+
+    try:
+        fallback = manifest_path_for(default_output_path(create_run_directory()))
+        return _emit_manifest_file(fallback, manifest)
+    except OSError as exc:  # noqa: BLE001 - never let this mask the run outcome
+        print(f"WARNING: the run manifest could not be written at all ({exc}).",
+              file=sys.stderr)
+        return None
+
+
+def probe_directory_writable(directory: Path) -> None:
+    """Create ``directory`` and prove a file can actually be written into it.
+
+    ``mkdir`` alone is not proof: an existing directory with no write bit
+    succeeds here and fails on the first image, which on this CLI means after
+    the whole paid run has finished.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    probe = directory / f".paperbanana_write_probe_{os.getpid()}"
+    try:
+        probe.write_text("", encoding="utf-8")
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
+def preflight_output_path(output_path: Path) -> Path:
+    """Fail in seconds on an unusable --output rather than after a paid run.
+
+    Nothing downstream touches the filesystem until the first image is saved,
+    which is 10-30 minutes and real money later.
+    """
+    output_path = Path(output_path)
+    try:
+        probe_directory_writable(output_path.parent)
+    except OSError as exc:
+        print(
+            f"ERROR: --output directory is not writable: {output_path.parent} ({exc})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return output_path
 
 
 @contextlib.contextmanager
@@ -791,6 +877,19 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
         print("ERROR: --content or --content-file is required.", file=sys.stderr)
         sys.exit(1)
 
+    # Resolve and prove out where artifacts land *before* anything is generated.
+    # An omitted --output means a fresh timestamped directory, so a repeat
+    # invocation cannot destroy a prior run. Resolved to an absolute path
+    # because the published stdout contract is absolute image paths.
+    output_explicit = bool(args.output)
+    if output_explicit:
+        output_path = preflight_output_path(Path(args.output).resolve())
+    else:
+        output_path = preflight_output_path(
+            default_output_path(create_run_directory())
+        )
+    print(f"[output] run directory: {output_path.parent}", file=sys.stderr)
+
     exp_mode = args.exp_mode
     exp_config = config.ExpConfig(
         dataset_name="Demo",
@@ -815,15 +914,6 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
     )
 
     num_candidates = args.num_candidates
-
-    # Resolve where artifacts land. An omitted --output means a fresh
-    # timestamped directory, so a repeat invocation cannot destroy a prior run.
-    output_explicit = bool(args.output)
-    if output_explicit:
-        output_path = Path(args.output).resolve()
-    else:
-        output_path = default_output_path(create_run_directory())
-    print(f"[output] run directory: {output_path.parent}", file=sys.stderr)
 
     # Build data dicts
     additional_info = build_additional_info(args)
@@ -891,6 +981,22 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
         outcome["manifest_path"] = manifest_path
 
 
+def positive_int(value: str) -> int:
+    """A count of candidates that a run can actually be judged against.
+
+    ``--num-candidates 0`` seeds no entries, so the run was stamped 'failed' and
+    exited 1 for producing nothing it was never asked to produce. Refusing the
+    input is the honest answer, and it costs nothing to give in milliseconds.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="PaperBanana Skill: generate academic diagrams/plots from text"
@@ -918,8 +1024,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"14-17cm -> 4k). Default: {DEFAULT_FIGURE_SIZE} (4k)")
     parser.add_argument("--max-critic-rounds", type=int, default=3,
                         help="Max critic refinement rounds (default: 3)")
-    parser.add_argument("--num-candidates", type=int, default=10,
-                        help="Number of parallel candidates to generate (default: 10)")
+    parser.add_argument("--num-candidates", type=positive_int, default=10,
+                        help="Number of parallel candidates to generate, at least 1 "
+                             "(default: 10)")
     parser.add_argument("--retrieval-setting", type=str, default="auto",
                         choices=["auto", "manual", "random", "none"],
                         help="Retrieval mode: auto (VLM selects refs), manual, random, or none (default: auto)")

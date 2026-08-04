@@ -8,6 +8,7 @@ salvage the batch.
 Offline only. Uses unittest.IsolatedAsyncioTestCase; pytest is not installed.
 """
 
+import base64
 import contextlib
 import io
 import json
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 from skill import run as skill_run
 from utils.paperviz_processor import PaperVizProcessor
 
-from tests.test_skill_run_manifest import args_namespace, full_result
+from tests.test_skill_run_manifest import SENTINEL_KEY, args_namespace, full_result
 
 
 def make_processor(single_query):
@@ -91,6 +92,13 @@ class ProcessQueriesBatchGuardTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_each_failure_is_reported_against_its_own_identity(self) -> None:
+        """The identity and the error text must come from the same candidate.
+
+        as_completed hands back futures in completion order, which need not
+        match the lowest-index scan that attributes the failure, so comparing
+        only the *set* of failed identities cannot tell a correctly paired
+        report from one that files candidate_1 under candidate_5's error.
+        """
         data_list = [{"filename": f"skill_candidate_{i}"} for i in range(6)]
         failing = {"skill_candidate_1", "skill_candidate_5"}
 
@@ -101,8 +109,79 @@ class ProcessQueriesBatchGuardTests(unittest.IsolatedAsyncioTestCase):
 
         drained = await self.drain(sometimes, data_list)
 
-        errors = {skill_run.candidate_identity(r) for r in drained if skill_run.is_error_record(r)}
-        self.assertEqual(errors, failing)
+        errors = {
+            skill_run.candidate_identity(record): record["candidate_error"]
+            for record in drained
+            if skill_run.is_error_record(record)
+        }
+        self.assertEqual(set(errors), failing)
+        for identity, message in errors.items():
+            self.assertIn(f"failed {identity}", message)
+
+    async def test_the_raw_sdk_error_text_never_reaches_the_run_stream(self) -> None:
+        """The processor's own announcement is upstream of every redaction.
+
+        A provider SDK that echoes the key it was called with would put a live
+        credential on the operator's log, which is exactly the stream a long
+        headless run gets teed to a file.
+        """
+        sentinel = SENTINEL_KEY
+        data_list = [{"filename": "skill_candidate_0"}]
+
+        async def raises(data, do_eval=True):
+            raise RuntimeError(f"400 INVALID_ARGUMENT: API key not valid: {sentinel}")
+
+        processor = make_processor(raises)
+        out, err = io.StringIO(), io.StringIO()
+        drained = []
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            async for record in processor.process_queries_batch(
+                data_list, max_concurrent=1, do_eval=False
+            ):
+                drained.append(record)
+
+        stream = out.getvalue() + err.getvalue()
+        self.assertNotIn(sentinel, stream)
+        # The failure is still announced, by type.
+        self.assertIn("skill_candidate_0 failed", stream)
+        self.assertIn("RuntimeError", stream)
+        # The record still carries the diagnosis for the caller to redact.
+        self.assertIn("INVALID_ARGUMENT", drained[0]["candidate_error"])
+
+    async def test_the_same_run_never_emits_the_key_both_masked_and_unmasked(self) -> None:
+        """End to end: processor announcement plus the caller's redacted one."""
+        sentinel = SENTINEL_KEY
+        data_list = [{"filename": "skill_candidate_0"}]
+        entries = skill_run.seed_manifest_entries(data_list)
+
+        async def raises(data, do_eval=True):
+            raise RuntimeError(f"401 Unauthorized (key={sentinel})")
+
+        processor = make_processor(raises)
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_kwargs = {
+                "exp_mode": "demo_full",
+                "output_path": skill_run.default_output_path(Path(tmp)),
+                "num_candidates": 1,
+                "output_explicit": False,
+                "figure_size": "14-17cm",
+                "image_size": "4k",
+                "aspect_ratio": "16:9",
+            }
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                await skill_run.drain_batch(
+                    processor.process_queries_batch(
+                        data_list, max_concurrent=1, do_eval=False
+                    ),
+                    entries,
+                    **save_kwargs,
+                )
+
+        stream = out.getvalue() + err.getvalue()
+        self.assertNotIn(sentinel, stream)
+        self.assertIn(skill_run.REDACTED_CREDENTIAL, stream)
+        self.assertNotIn(sentinel, entries["skill_candidate_0"]["error"])
 
 
 class DrainBatchTests(unittest.IsolatedAsyncioTestCase):
@@ -175,6 +254,70 @@ class DrainBatchTests(unittest.IsolatedAsyncioTestCase):
 
         written = sorted(p.name for p in self.tmp.iterdir())
         self.assertEqual(written, ["skill_candidate_0.png", "skill_candidate_2.png"])
+
+    async def test_a_result_that_cannot_be_written_fails_alone(self) -> None:
+        """The consumer side of "a failing candidate cannot destroy the batch".
+
+        A raise inside the ``async for`` body escapes the loop, which closes the
+        async generator and cancels every undrained candidate, so a single bad
+        payload discarded pipeline work that had already been paid for.
+        """
+        data_list = [{"filename": f"skill_candidate_{i}"} for i in range(4)]
+        entries = skill_run.seed_manifest_entries(data_list)
+
+        undecodable = full_result("skill_candidate_1")
+        # Decodes cleanly, is not an image: PIL raises on open.
+        undecodable["target_diagram_critic_desc1_base64_jpg"] = base64.b64encode(
+            b"definitely not a png"
+        ).decode("ascii")
+
+        stream = self._stream(
+            [
+                full_result("skill_candidate_0"),
+                undecodable,
+                full_result("skill_candidate_2"),
+                full_result("skill_candidate_3"),
+            ]
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            await skill_run.drain_batch(stream, entries, **self.save_kwargs)
+
+        self.assertEqual(entries["skill_candidate_1"]["status"], "failed")
+        self.assertIsNotNone(entries["skill_candidate_1"]["error"])
+        for identity in ("skill_candidate_0", "skill_candidate_2", "skill_candidate_3"):
+            self.assertEqual(entries[identity]["status"], "succeeded")
+        self.assertEqual(
+            sorted(p.name for p in self.tmp.iterdir()),
+            ["skill_candidate_0.png", "skill_candidate_2.png", "skill_candidate_3.png"],
+        )
+        self.assertEqual(skill_run.run_status(entries), "partial")
+
+    async def test_an_unwritable_destination_fails_candidates_not_the_drain(self) -> None:
+        """Every candidate is accounted for even when nothing can be written."""
+        readonly = self.tmp / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        self.addCleanup(readonly.chmod, 0o700)
+
+        data_list = [{"filename": f"skill_candidate_{i}"} for i in range(4)]
+        entries = skill_run.seed_manifest_entries(data_list)
+        save_kwargs = dict(
+            self.save_kwargs,
+            output_path=skill_run.default_output_path(readonly / "figs"),
+            num_candidates=4,
+        )
+        stream = self._stream([full_result(d["filename"]) for d in data_list])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            await skill_run.drain_batch(stream, entries, **save_kwargs)
+
+        self.assertEqual(
+            {entry["status"] for entry in entries.values()}, {"failed"}
+        )
+        self.assertEqual(skill_run.run_status(entries), "failed")
+        for entry in entries.values():
+            self.assertIn("Error", entry["error"])
 
     async def test_run_dying_mid_drain_leaves_seeded_entries_partial(self) -> None:
         data_list = [{"filename": f"skill_candidate_{i}"} for i in range(10)]

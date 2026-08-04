@@ -5,9 +5,12 @@ Offline only. No model provider is contacted.
 
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -184,6 +187,33 @@ class TraceTests(unittest.TestCase):
         self.assertFalse(skill_run.looks_like_base64_payload(None))
         self.assertFalse(skill_run.looks_like_base64_payload(42))
 
+    def test_long_punctuation_free_prose_survives_the_scrub(self) -> None:
+        """The elision must not destroy the reasoning it sits next to.
+
+        A character-class check alone matched any long string of letters, digits
+        and whitespace, so a terse enumerated stage description with no
+        punctuation was replaced by the elision marker and lost.
+        """
+        prose = "the model draws a box then an arrow then another box " * 12
+        self.assertGreater(len(prose), skill_run.BASE64_VALUE_MIN_LENGTH)
+
+        self.assertFalse(skill_run.looks_like_base64_payload(prose))
+
+        result = full_result("skill_candidate_0")
+        result["target_diagram_critic_suggestions0"] = prose
+        trace = skill_run.build_candidate_trace(result, "demo_full")
+
+        critic0 = next(stage for stage in trace if stage["name"] == "Critic Round 0")
+        self.assertEqual(critic0["suggestions"], prose)
+        self.assertNotIn(skill_run.ELIDED_PAYLOAD, json.dumps(trace))
+
+    def test_a_line_wrapped_payload_is_still_elided(self) -> None:
+        """Providers wrap base64 on newlines, so newlines cannot disqualify it."""
+        blob = long_base64_blob()
+        wrapped = "\n".join(blob[i:i + 76] for i in range(0, len(blob), 76))
+
+        self.assertTrue(skill_run.looks_like_base64_payload(wrapped))
+
 
 class BackendDerivationTests(unittest.TestCase):
     def test_backend_is_derived_from_model_name_and_openrouter_client(self) -> None:
@@ -204,14 +234,75 @@ class BackendDerivationTests(unittest.TestCase):
 
 
 class RepoCommitTests(unittest.TestCase):
-    def test_commit_is_recorded_with_an_explicit_dirty_flag(self) -> None:
-        record = skill_run.repo_commit_record()
+    """The manifest claims to pin the commit the run executed at.
 
-        self.assertIn("commit", record)
-        self.assertIn("dirty", record)
-        self.assertIsInstance(record["dirty"], bool)
-        if record["commit"] is not None:
-            self.assertRegex(record["commit"], r"^[0-9a-f]{40}$")
+    Asserting the shape of the commit only when it is not None, and asserting
+    the dirty flag is a bool, passes in exactly the two cases worth catching: a
+    commit lookup that silently returns nothing, and a dirty flag hardcoded
+    clean. A throwaway repository makes both values knowable.
+    """
+
+    def make_repo(self) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.git(tmp, "init", "-q")
+        self.git(tmp, "config", "user.email", "test@example.invalid")
+        self.git(tmp, "config", "user.name", "PaperBanana Tests")
+        (tmp / "tracked.txt").write_text("original\n", encoding="utf-8")
+        self.git(tmp, "add", "tracked.txt")
+        self.git(tmp, "commit", "-q", "-m", "initial")
+        return tmp
+
+    @staticmethod
+    def git(repo: Path, *argv) -> str:
+        # hooksPath is neutralised because a developer's *global* hooks would
+        # otherwise run against this throwaway repository; a secret-scanning
+        # pre-commit hook on this machine blocks indefinitely when its stdout is
+        # a pipe, which would wedge the whole suite rather than fail it.
+        completed = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", *argv],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    def record_for(self, repo: Path) -> dict:
+        with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", repo):
+            return skill_run.repo_commit_record()
+
+    def test_the_recorded_commit_is_the_commit_head_actually_points_at(self) -> None:
+        repo = self.make_repo()
+        expected = self.git(repo, "rev-parse", "HEAD")
+
+        record = self.record_for(repo)
+
+        self.assertEqual(record["commit"], expected)
+        self.assertRegex(record["commit"], r"^[0-9a-f]{40}$")
+
+    def test_the_dirty_flag_follows_the_state_of_the_checkout(self) -> None:
+        repo = self.make_repo()
+
+        self.assertFalse(self.record_for(repo)["dirty"])
+
+        (repo / "tracked.txt").write_text("edited after the commit\n", encoding="utf-8")
+
+        self.assertTrue(self.record_for(repo)["dirty"])
+
+    def test_an_untracked_file_also_counts_as_dirty(self) -> None:
+        repo = self.make_repo()
+        (repo / "scratch.txt").write_text("not committed\n", encoding="utf-8")
+
+        self.assertTrue(self.record_for(repo)["dirty"])
+
+    def test_a_checkout_that_is_not_a_repository_records_no_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record_for(Path(tmp))
+
+        self.assertIsNone(record["commit"])
+        self.assertFalse(record["dirty"])
 
 
 class ManifestBuildTests(unittest.TestCase):
@@ -324,7 +415,13 @@ class ManifestBuildTests(unittest.TestCase):
         self.assertEqual(params["retrieval_setting"], "auto")
 
         self.assertEqual(manifest["input"]["content"], "method text")
-        self.assertEqual(len(manifest["input"]["content_sha256"]), 64)
+        # Matched against the content it claims to pin, not merely well-formed:
+        # hashing the wrong bytes still yields a plausible 64-char digest.
+        self.assertEqual(
+            manifest["input"]["content_sha256"],
+            hashlib.sha256(b"method text").hexdigest(),
+        )
+        self.assertEqual(manifest["input"]["content_chars"], len("method text"))
 
     def test_sentinel_credential_never_reaches_the_serialized_manifest(self) -> None:
         """Allowlist construction, not filtering. Sentinel is asserted non-empty
@@ -398,6 +495,107 @@ class ManifestBuildTests(unittest.TestCase):
 
         self.assertTrue(path.exists())
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["run"]["status"], "complete")
+
+
+class OutputPreflightTests(unittest.TestCase):
+    """An unusable --output must cost seconds, not a paid run.
+
+    Nothing touched the filesystem until the first image was saved, which on
+    this CLI is after the whole 10-30 minute batch has finished computing.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def read_only_dir(self) -> Path:
+        readonly = self.tmp / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        self.addCleanup(readonly.chmod, 0o700)
+        return readonly
+
+    def test_a_writable_destination_is_created_and_left_clean(self) -> None:
+        target = self.tmp / "nested" / "deeper" / "figure.png"
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            resolved = skill_run.preflight_output_path(target)
+
+        self.assertEqual(resolved, target)
+        self.assertTrue(target.parent.is_dir())
+        # The write probe is not left behind next to the images.
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+    def test_an_existing_directory_with_no_write_bit_is_caught(self) -> None:
+        """mkdir alone is not proof: it succeeds on a directory it cannot write."""
+        readonly = self.read_only_dir()
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                skill_run.preflight_output_path(readonly / "figure.png")
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not writable", err.getvalue())
+
+    def test_a_destination_whose_parent_cannot_be_created_is_caught(self) -> None:
+        readonly = self.read_only_dir()
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                skill_run.preflight_output_path(readonly / "figs" / "figure.png")
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not writable", err.getvalue())
+
+
+class ManifestFallbackTests(unittest.TestCase):
+    """The manifest must not be lost with the destination that lost the run.
+
+    write_manifest targets the same directory whose unwritability is the most
+    likely reason the run failed, so a bare write there and nowhere else means
+    the operator gets a traceback and no record at all.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_an_unwritable_destination_falls_back_to_a_fresh_run_directory(self) -> None:
+        readonly = self.tmp / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        self.addCleanup(readonly.chmod, 0o700)
+        fallback_base = self.tmp / "skill_runs"
+        manifest = {"run": {"status": "partial"}, "candidates": []}
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with unittest.mock.patch.object(
+                skill_run, "DEFAULT_RUN_BASE_DIR", fallback_base
+            ):
+                path = skill_run.write_manifest(
+                    readonly / "figs" / "output.manifest.json", manifest
+                )
+
+        self.assertIsNotNone(path, "the run record was lost")
+        self.assertTrue(path.exists())
+        self.assertIn(fallback_base, path.parents)
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["run"]["status"], "partial"
+        )
+        self.assertIn("falling back", err.getvalue())
+
+    def test_a_writable_destination_is_still_used_verbatim(self) -> None:
+        target = self.tmp / "figs" / "output.manifest.json"
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            path = skill_run.write_manifest(target, {"run": {"status": "complete"}})
+
+        self.assertEqual(path, target)
 
 
 class UnattributedFailureTests(unittest.TestCase):
