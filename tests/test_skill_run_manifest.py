@@ -24,6 +24,9 @@ from tests.test_skill_run_candidate_identity import png_b64
 
 
 SENTINEL_KEY = "AIzaSy-THIS-IS-A-TEST-SENTINEL-NOT-A-REAL-KEY"
+# Deliberately NOT key-shaped, so only the model_config.yaml value-sourcing
+# branch of redact_credentials can catch it. See the pair of tests below.
+UNSHAPED_CONFIG_SENTINEL = "PBTEST-config-sourced-sentinel-0011223344"
 
 
 def long_base64_blob(nbytes: int = 2048) -> str:
@@ -701,19 +704,51 @@ class ErrorTextRedactionTests(unittest.TestCase):
         self.assertIn(skill_run.REDACTED_CREDENTIAL, redacted)
 
     def test_a_key_from_model_config_yaml_is_redacted_by_value(self) -> None:
-        """R7a names configs/model_config.yaml explicitly as a surface."""
+        """R7a names configs/model_config.yaml explicitly as a surface.
+
+        Uses a deliberately non-key-shaped sentinel. With the shaped SENTINEL_KEY
+        this test could not fail: ``_KEY_SHAPED_RE`` caught it regardless, so the
+        config-sourcing branch could be deleted outright and the test stayed green.
+        """
+        # Guard the guard. If the shape regex can match the sentinel, this test
+        # is vacuous again and should fail loudly rather than pass for free.
+        self.assertIsNone(
+            skill_run._KEY_SHAPED_RE.search(UNSHAPED_CONFIG_SENTINEL),
+            "sentinel must not be key-shaped, or the shape regex redacts it and "
+            "the model_config.yaml branch goes untested",
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             configs = Path(tmp) / "configs"
             configs.mkdir()
             (configs / "model_config.yaml").write_text(
-                f'api_keys:\n  google_api_key: "{SENTINEL_KEY}"\n', encoding="utf-8"
+                f'api_keys:\n  google_api_key: "{UNSHAPED_CONFIG_SENTINEL}"\n',
+                encoding="utf-8",
             )
             with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", Path(tmp)):
                 redacted = skill_run.redact_credentials(
-                    f"PermissionDenied: key {SENTINEL_KEY} lacks access"
+                    f"PermissionDenied: key {UNSHAPED_CONFIG_SENTINEL} lacks access"
                 )
 
-        self.assertNotIn(SENTINEL_KEY, redacted)
+        self.assertNotIn(UNSHAPED_CONFIG_SENTINEL, redacted)
+        self.assertIn(skill_run.REDACTED_CREDENTIAL, redacted)
+
+    def test_an_unshaped_key_survives_when_it_is_not_in_the_config(self) -> None:
+        """Pins that the previous test passes via config sourcing, not the regex.
+
+        Same sentinel, same call, but no config declaring it: it must come back
+        untouched. If this ever starts redacting, the sibling test has stopped
+        proving what it claims.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "configs").mkdir()
+            with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", Path(tmp)):
+                with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                    redacted = skill_run.redact_credentials(
+                        f"PermissionDenied: key {UNSHAPED_CONFIG_SENTINEL} lacks access"
+                    )
+
+        self.assertIn(UNSHAPED_CONFIG_SENTINEL, redacted)
 
     def test_a_malformed_config_file_does_not_break_redaction(self) -> None:
         """A manifest must still be written when the config cannot be parsed."""

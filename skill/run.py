@@ -797,6 +797,37 @@ def preflight_output_path(output_path: Path) -> Path:
     return output_path
 
 
+def resolve_output_path(args) -> Path:
+    """Decide where artifacts land, and prove the location usable, in one place.
+
+    Creating the default run directory has to sit inside the same guard as the
+    writability probe. Left outside it, an unwritable ``results/skill_runs``
+    raises a bare OSError traceback instead of the clean exit-2 path that an
+    unusable ``--output`` gets.
+    """
+    # ``is not None`` rather than truthiness: an explicitly empty --output is a
+    # caller error, not the omitted case, and must not be silently rewritten
+    # into a timestamped run directory.
+    if args.output is not None:
+        if not args.output.strip():
+            print(
+                "ERROR: --output was given an empty path. Omit the flag entirely "
+                "to write to a fresh timestamped run directory.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return preflight_output_path(Path(args.output).resolve())
+    try:
+        run_dir = create_run_directory()
+    except OSError as exc:
+        print(
+            f"ERROR: cannot create the default run directory ({exc})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return preflight_output_path(default_output_path(run_dir))
+
+
 @contextlib.contextmanager
 def quiet_pipeline_stdout():
     """Send the pipeline's own print() chatter to stderr.
@@ -854,6 +885,27 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
     caller can emit whatever survived even if this raises.
     """
     ensure_model_config()
+
+    # Read content from file if --content-file is given
+    content = args.content
+    if args.content_file:
+        content = Path(args.content_file).read_text(encoding="utf-8")
+    if not content:
+        print("ERROR: --content or --content-file is required.", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve and prove out where artifacts land *before* anything is generated,
+    # and before the dataset download. An omitted --output means a fresh
+    # timestamped directory, so a repeat invocation cannot destroy a prior run.
+    # Resolved to an absolute path because the published stdout contract is
+    # absolute image paths.
+    output_explicit = args.output is not None
+    output_path = resolve_output_path(args)
+    print(f"[output] run directory: {output_path.parent}", file=sys.stderr)
+
+    # Only now pay for the dataset. On a first run this is a multi-hundred-MB
+    # HuggingFace download, and SKILL.md promises an unusable --output fails in
+    # seconds; ordering it after the preflight is what makes that promise true.
     ensure_dataset(args.task)
 
     # Late imports so env is ready. These are inside the redirect on purpose:
@@ -868,27 +920,6 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
     from agents.polish_agent import PolishAgent
     from utils import config, generation_utils
     from utils.paperviz_processor import PaperVizProcessor
-
-    # Read content from file if --content-file is given
-    content = args.content
-    if args.content_file:
-        content = Path(args.content_file).read_text(encoding="utf-8")
-    if not content:
-        print("ERROR: --content or --content-file is required.", file=sys.stderr)
-        sys.exit(1)
-
-    # Resolve and prove out where artifacts land *before* anything is generated.
-    # An omitted --output means a fresh timestamped directory, so a repeat
-    # invocation cannot destroy a prior run. Resolved to an absolute path
-    # because the published stdout contract is absolute image paths.
-    output_explicit = bool(args.output)
-    if output_explicit:
-        output_path = preflight_output_path(Path(args.output).resolve())
-    else:
-        output_path = preflight_output_path(
-            default_output_path(create_run_directory())
-        )
-    print(f"[output] run directory: {output_path.parent}", file=sys.stderr)
 
     exp_mode = args.exp_mode
     exp_config = config.ExpConfig(

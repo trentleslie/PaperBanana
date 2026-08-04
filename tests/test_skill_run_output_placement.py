@@ -8,6 +8,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from skill import run as skill_run
@@ -143,6 +144,74 @@ class OutputPlacementTests(unittest.TestCase):
         for directory in (first_dir, second_dir):
             names = sorted(p.name for p in directory.iterdir())
             self.assertEqual(names, ["skill_candidate_0.png", "skill_candidate_1.png"])
+
+
+class ResolveOutputPathTests(unittest.TestCase):
+    """The preflight must be the single clean exit for every unusable target."""
+
+    def test_an_empty_output_is_rejected_rather_than_treated_as_omitted(self) -> None:
+        """`--output ""` is a caller error, not the omitted case."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                skill_run.resolve_output_path(parse("--output", ""))
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("empty path", stderr.getvalue())
+
+    def test_an_unwritable_explicit_output_exits_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            locked = Path(tmp) / "locked"
+            locked.mkdir(mode=0o500)
+            try:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        skill_run.resolve_output_path(
+                            parse("--output", str(locked / "f.png"))
+                        )
+            finally:
+                # Restore before the tempdir teardown, which cannot remove 0o500.
+                locked.chmod(0o700)
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not writable", stderr.getvalue())
+
+    def test_an_unwritable_default_base_exits_two_instead_of_raising(self) -> None:
+        """Creating the default run dir sits inside the same guard as the probe.
+
+        Left outside it, an unwritable results/skill_runs produced a raw
+        PermissionError traceback rather than the clean exit-2 path.
+        """
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(
+            skill_run, "create_run_directory", side_effect=PermissionError("denied")
+        ):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    skill_run.resolve_output_path(parse())
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("default run directory", stderr.getvalue())
+
+
+class PreflightOrderingTests(unittest.IsolatedAsyncioTestCase):
+    """SKILL.md promises an unusable --output fails in seconds.
+
+    That is only true while the preflight runs before ensure_dataset, which on a
+    first run is a multi-hundred-MB HuggingFace download.
+    """
+
+    async def test_an_unusable_output_exits_before_the_dataset_download(self) -> None:
+        with unittest.mock.patch.object(skill_run, "ensure_model_config"), \
+             unittest.mock.patch.object(skill_run, "ensure_dataset") as dataset, \
+             unittest.mock.patch.object(
+                 skill_run, "resolve_output_path", side_effect=SystemExit(2)
+             ):
+            with self.assertRaises(SystemExit):
+                await skill_run._execute_run(parse("--output", "x.png"), {}, {})
+
+        dataset.assert_not_called()
 
 
 if __name__ == "__main__":
