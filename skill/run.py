@@ -20,6 +20,7 @@ Generates publication-quality academic diagrams and plots from method text.
 import argparse
 import asyncio
 import base64
+import re
 import shutil
 import sys
 from io import BytesIO
@@ -183,6 +184,92 @@ def extract_final_image_b64(result: dict, exp_mode: str) -> str | None:
     return result.get(key)
 
 
+def candidate_identity(result) -> str | None:
+    """Return the candidate's own identity, or None when it cannot be derived.
+
+    One shared identity function: this same string names the PNG and keys the
+    manifest entry, so the two can never disagree.
+    """
+    if not isinstance(result, dict):
+        return None
+    raw = result.get("filename")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw.strip())
+
+
+def resolve_save_path(identity: str, output_path: Path, num_candidates: int) -> Path:
+    """Map a candidate identity to the path its image is written to.
+
+    A single candidate with an explicit --output keeps its exact-path contract.
+    """
+    if num_candidates == 1:
+        return output_path
+    suffix = output_path.suffix or ".png"
+    return output_path.parent / f"{output_path.stem}_{identity}{suffix}"
+
+
+def save_result_images(
+    results,
+    *,
+    exp_mode: str,
+    output_path: Path,
+    num_candidates: int,
+    figure_size: str,
+    image_size: str,
+    aspect_ratio: str,
+) -> list[dict]:
+    """Write each result's final image, named from that result's own identity.
+
+    Returns one record per result, including results that produced no image, so
+    a caller can pair reasoning with artifacts without re-deriving anything.
+    """
+    from PIL import Image
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict] = []
+    for result in results:
+        identity = candidate_identity(result)
+        if identity is None:
+            print(
+                "WARNING: result has no usable 'filename'; skipping rather than "
+                "writing it under a fabricated name.",
+                file=sys.stderr,
+            )
+            continue
+
+        b64 = extract_final_image_b64(result, exp_mode)
+        if not b64:
+            print(f"WARNING: No image produced for candidate {identity}.", file=sys.stderr)
+            saved.append({"identity": identity, "image_path": None, "dimensions": None})
+            continue
+
+        if "," in b64:
+            b64 = b64.split(",")[1]
+        img = Image.open(BytesIO(base64.b64decode(b64)))
+
+        save_path = resolve_save_path(identity, output_path, num_candidates)
+        img.save(str(save_path), format="PNG")
+
+        width, height = img.size
+        dimensions = describe_image_dimensions(
+            figure_size, image_size, aspect_ratio, width, height
+        )
+        print(format_dimension_report(dimensions, label=save_path.name), file=sys.stderr)
+
+        saved.append(
+            {
+                "identity": identity,
+                "image_path": str(save_path),
+                "dimensions": dimensions,
+            }
+        )
+
+    return saved
+
+
 async def run(args):
     ensure_model_config()
     ensure_dataset(args.task)
@@ -260,46 +347,20 @@ async def run(args):
         print("ERROR: Pipeline returned no results.", file=sys.stderr)
         sys.exit(1)
 
-    # Save images
-    from PIL import Image
+    # Save images, named from each candidate's own identity
+    saved = save_result_images(
+        results,
+        exp_mode=exp_mode,
+        output_path=Path(args.output).resolve(),
+        num_candidates=num_candidates,
+        figure_size=args.figure_size,
+        image_size=additional_info.get("image_size", ""),
+        aspect_ratio=args.aspect_ratio,
+    )
 
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    saved_paths = []
-    for idx, result in enumerate(results):
-        b64 = extract_final_image_b64(result, exp_mode)
-        if not b64:
-            print(f"WARNING: No image produced for candidate {idx}.", file=sys.stderr)
-            continue
-
-        if "," in b64:
-            b64 = b64.split(",")[1]
-        image_data = base64.b64decode(b64)
-        img = Image.open(BytesIO(image_data))
-
-        if num_candidates == 1:
-            save_path = output_path
-        else:
-            stem = output_path.stem
-            suffix = output_path.suffix or ".png"
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-
-        img.save(str(save_path), format="PNG")
-        saved_paths.append(str(save_path))
-
-        width, height = img.size
-        desc = describe_image_dimensions(
-            args.figure_size,
-            additional_info.get("image_size", ""),
-            args.aspect_ratio,
-            width,
-            height,
-        )
-        print(format_dimension_report(desc, label=save_path.name), file=sys.stderr)
-
-    for p in saved_paths:
-        print(p)
+    for entry in saved:
+        if entry["image_path"]:
+            print(entry["image_path"])
 
 
 def build_parser() -> argparse.ArgumentParser:
