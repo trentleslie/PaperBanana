@@ -23,6 +23,7 @@ import base64
 import re
 import shutil
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -53,6 +54,12 @@ IMAGE_SIZE_EXPECTED_PIXELS = {
 SIZE_SHORTFALL_FRACTION = 0.75
 # Relative tolerance on the requested aspect ratio.
 ASPECT_RATIO_TOLERANCE = 0.05
+
+# Runs default to a fresh timestamped directory so a repeat invocation cannot
+# destroy a prior run's images or manifest.
+DEFAULT_RUN_BASE_DIR = PROJECT_ROOT / "results" / "skill_runs"
+RUN_DIR_PREFIX = "run_"
+DEFAULT_OUTPUT_NAME = "output.png"
 
 
 def build_additional_info(args) -> dict:
@@ -198,14 +205,53 @@ def candidate_identity(result) -> str | None:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw.strip())
 
 
-def resolve_save_path(identity: str, output_path: Path, num_candidates: int) -> Path:
+def create_run_directory(base_dir: Path | None = None, timestamp: str | None = None) -> Path:
+    """Create and return a fresh timestamped run directory.
+
+    Created with ``exist_ok=False`` and retried with a counter so two runs
+    starting in the same second cannot merge their artifacts.
+    """
+    base = Path(base_dir) if base_dir is not None else DEFAULT_RUN_BASE_DIR
+    base.mkdir(parents=True, exist_ok=True)
+
+    stamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
+    candidate = base / f"{RUN_DIR_PREFIX}{stamp}"
+    collision = 1
+    while True:
+        try:
+            candidate.mkdir(exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = base / f"{RUN_DIR_PREFIX}{stamp}_{collision}"
+            collision += 1
+
+
+def default_output_path(run_dir: Path) -> Path:
+    """The nominal output path inside a timestamped run directory.
+
+    Only its parent and suffix are used for images; it also supplies the stem
+    the manifest shares.
+    """
+    return Path(run_dir) / DEFAULT_OUTPUT_NAME
+
+
+def resolve_save_path(
+    identity: str,
+    output_path: Path,
+    num_candidates: int,
+    output_explicit: bool = True,
+) -> Path:
     """Map a candidate identity to the path its image is written to.
 
     A single candidate with an explicit --output keeps its exact-path contract.
+    With --output omitted every candidate is named purely from its identity
+    inside the run directory.
     """
+    suffix = output_path.suffix or ".png"
+    if not output_explicit:
+        return output_path.parent / f"{identity}{suffix}"
     if num_candidates == 1:
         return output_path
-    suffix = output_path.suffix or ".png"
     return output_path.parent / f"{output_path.stem}_{identity}{suffix}"
 
 
@@ -218,6 +264,7 @@ def save_result_images(
     figure_size: str,
     image_size: str,
     aspect_ratio: str,
+    output_explicit: bool = True,
 ) -> list[dict]:
     """Write each result's final image, named from that result's own identity.
 
@@ -250,7 +297,9 @@ def save_result_images(
             b64 = b64.split(",")[1]
         img = Image.open(BytesIO(base64.b64decode(b64)))
 
-        save_path = resolve_save_path(identity, output_path, num_candidates)
+        save_path = resolve_save_path(
+            identity, output_path, num_candidates, output_explicit=output_explicit
+        )
         img.save(str(save_path), format="PNG")
 
         width, height = img.size
@@ -318,6 +367,15 @@ async def run(args):
 
     num_candidates = args.num_candidates
 
+    # Resolve where artifacts land. An omitted --output means a fresh
+    # timestamped directory, so a repeat invocation cannot destroy a prior run.
+    output_explicit = bool(args.output)
+    if output_explicit:
+        output_path = Path(args.output).resolve()
+    else:
+        output_path = default_output_path(create_run_directory())
+    print(f"[output] run directory: {output_path.parent}", file=sys.stderr)
+
     # Build data dicts
     additional_info = build_additional_info(args)
     print(
@@ -351,8 +409,9 @@ async def run(args):
     saved = save_result_images(
         results,
         exp_mode=exp_mode,
-        output_path=Path(args.output).resolve(),
+        output_path=output_path,
         num_candidates=num_candidates,
+        output_explicit=output_explicit,
         figure_size=args.figure_size,
         image_size=additional_info.get("image_size", ""),
         aspect_ratio=args.aspect_ratio,
@@ -376,8 +435,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", type=str, default="diagram",
                         choices=["diagram", "plot"],
                         help="Task type: diagram or plot")
-    parser.add_argument("--output", type=str, default="output.png",
-                        help="Output image path (default: output.png)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output image path. Omitted, artifacts are written to a "
+                             "fresh timestamped directory under results/skill_runs/ so "
+                             "a repeat invocation cannot destroy a prior run.")
     parser.add_argument("--aspect-ratio", type=str, default=DEFAULT_ASPECT_RATIO,
                         choices=["21:9", "16:9", "3:2"],
                         help=f"Aspect ratio (default: {DEFAULT_ASPECT_RATIO})")
