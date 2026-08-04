@@ -540,13 +540,13 @@ async def drain_batch(result_stream, entries: dict, **save_kwargs) -> None:
             record_result(result_data, entries, **save_kwargs)
 
 
-def build_retrieval_record(data_list) -> dict:
+def build_retrieval_record(data_list, setting: str | None = None) -> dict:
     """Retrieval runs once per batch, so it is recorded once per run."""
     first = data_list[0] if data_list else {}
     references = first.get("top10_references") or []
     examples = first.get("retrieved_examples") or []
     return {
-        "setting": None,
+        "setting": setting,
         "top10_references_count": len(references),
         "retrieved_examples_count": len(examples),
         "top10_references": scrub_payloads(references),
@@ -768,10 +768,7 @@ async def run(args):
                 exp_config.image_gen_model_name,
                 getattr(generation_utils, "openrouter_client", None),
             ),
-            retrieval={
-                **build_retrieval_record(data_list),
-                "setting": args.retrieval_setting,
-            },
+            retrieval=build_retrieval_record(data_list, args.retrieval_setting),
             started_at=started_at,
             finished_at=_utc_timestamp(),
         )
