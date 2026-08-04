@@ -522,6 +522,24 @@ def record_failure(identity, entries: dict, error) -> dict:
     return entry
 
 
+def is_error_record(result) -> bool:
+    """True for the explicit error record process_queries_batch now yields."""
+    return isinstance(result, dict) and bool(result.get("candidate_error"))
+
+
+async def drain_batch(result_stream, entries: dict, **save_kwargs) -> None:
+    """Drain the batch, folding both successes and failures into the entries."""
+    async for result_data in result_stream:
+        if is_error_record(result_data):
+            record_failure(
+                candidate_identity(result_data),
+                entries,
+                result_data.get("candidate_error"),
+            )
+        else:
+            record_result(result_data, entries, **save_kwargs)
+
+
 def build_retrieval_record(data_list) -> dict:
     """Retrieval runs once per batch, so it is recorded once per run."""
     first = data_list[0] if data_list else {}
@@ -728,10 +746,13 @@ async def run(args):
     try:
         # Pipeline chatter goes to stderr so stdout stays parseable.
         with quiet_pipeline_stdout():
-            async for result_data in processor.process_queries_batch(
-                data_list, max_concurrent=num_candidates, do_eval=False
-            ):
-                record_result(result_data, entries, **save_kwargs)
+            await drain_batch(
+                processor.process_queries_batch(
+                    data_list, max_concurrent=num_candidates, do_eval=False
+                ),
+                entries,
+                **save_kwargs,
+            )
     finally:
         # Single emitter, reached on every exit path.
         manifest = build_manifest(
