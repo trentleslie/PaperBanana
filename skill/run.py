@@ -20,10 +20,15 @@ Generates publication-quality academic diagrams and plots from method text.
 import argparse
 import asyncio
 import base64
+import contextlib
+import hashlib
+import json
 import re
 import shutil
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -35,6 +40,7 @@ from utils.legacy_generation_options import (  # noqa: E402
     FIGURE_SIZE_TO_IMAGE_SIZE,
     generation_additional_info,
 )
+from utils.legacy_ui_results import BASE64_SUFFIX  # noqa: E402
 
 FIGURE_SIZE_CHOICES = list(FIGURE_SIZE_TO_IMAGE_SIZE)
 DEFAULT_FIGURE_SIZE = "14-17cm"
@@ -60,6 +66,15 @@ ASPECT_RATIO_TOLERANCE = 0.05
 DEFAULT_RUN_BASE_DIR = PROJECT_ROOT / "results" / "skill_runs"
 RUN_DIR_PREFIX = "run_"
 DEFAULT_OUTPUT_NAME = "output.png"
+
+# Run record. Written on every run, beside the images, sharing the output stem.
+MANIFEST_SUFFIX = ".manifest.json"
+MANIFEST_VERSION = 1
+ELIDED_PAYLOAD = "<elided: base64 image payload>"
+# Long enough that prose never trips it, short enough that no real payload slips
+# through: the smallest images the pipeline emits are several KB base64.
+BASE64_VALUE_MIN_LENGTH = 512
+_BASE64_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
 
 def build_additional_info(args) -> dict:
@@ -319,6 +334,307 @@ def save_result_images(
     return saved
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def manifest_path_for(output_path: Path) -> Path:
+    """The manifest travels with the images and shares the --output stem."""
+    output_path = Path(output_path)
+    return output_path.parent / f"{output_path.stem}{MANIFEST_SUFFIX}"
+
+
+def seed_manifest_entries(data_list) -> dict:
+    """One entry per *requested* candidate, before anything is drained.
+
+    Completeness is evaluated against what was asked for, not against what was
+    observed, so a run that dies part-way cannot stamp itself complete.
+    """
+    entries: dict[str, dict] = {}
+    for index, data in enumerate(data_list):
+        identity = candidate_identity(data) or f"unidentified_candidate_{index}"
+        entries[identity] = {
+            "identity": identity,
+            "status": "missing",
+            "image_path": None,
+            "dimensions": None,
+            "trace": None,
+            "error": None,
+        }
+    return entries
+
+
+def run_status(entries: dict) -> str:
+    """complete only when every seeded entry succeeded."""
+    statuses = {entry.get("status") for entry in entries.values()}
+    if statuses == {"succeeded"}:
+        return "complete"
+    if "succeeded" in statuses:
+        return "partial"
+    return "failed"
+
+
+def looks_like_base64_payload(value) -> bool:
+    """True for values that are image payloads rather than prose.
+
+    A key-name check alone would admit a blob stored under another name.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if text.startswith("data:image"):
+        return True
+    if len(text) < BASE64_VALUE_MIN_LENGTH:
+        return False
+    return bool(_BASE64_VALUE_RE.match(text))
+
+
+def scrub_payloads(value):
+    """Drop base64-suffixed keys and elide payload-shaped values, recursively."""
+    if isinstance(value, dict):
+        return {
+            key: scrub_payloads(item)
+            for key, item in value.items()
+            if not (isinstance(key, str) and key.endswith(BASE64_SUFFIX))
+        }
+    if isinstance(value, (list, tuple)):
+        return [scrub_payloads(item) for item in value]
+    if looks_like_base64_payload(value):
+        return ELIDED_PAYLOAD
+    return value
+
+
+def build_candidate_trace(result: dict, exp_mode: str) -> list[dict]:
+    """Per-candidate reasoning trace, built from the shared UI stage helper."""
+    from utils.legacy_ui_results import build_evolution_stages
+
+    trace: list[dict] = []
+    for stage in build_evolution_stages(result, exp_mode=exp_mode):
+        record = {
+            "name": stage.get("name"),
+            "image_key": stage.get("image_key"),
+            "description_label": stage.get("description"),
+        }
+
+        desc_key = stage.get("desc_key")
+        if desc_key:
+            record["description_key"] = desc_key
+            record["description"] = scrub_payloads(result.get(desc_key))
+
+        # Only Critic stages carry suggestions_key; a literal lookup would raise
+        # on the first stage of every candidate.
+        suggestions_key = stage.get("suggestions_key")
+        if suggestions_key:
+            record["suggestions_key"] = suggestions_key
+            record["suggestions"] = scrub_payloads(result.get(suggestions_key))
+
+        trace.append(record)
+    return trace
+
+
+def derive_image_gen_backend(image_gen_model_name: str, openrouter_client) -> str:
+    """Mirror the branch visualizer_agent takes at call time.
+
+    Derived from ambient config, not observed from the provider, hence the
+    '_derived' suffix on the manifest field.
+    """
+    if "gpt-image" in (image_gen_model_name or ""):
+        return "openai"
+    if openrouter_client is not None:
+        return "openrouter"
+    return "gemini"
+
+
+def repo_commit_record() -> dict:
+    """The commit the run executed at, with a dirty checkout stated explicitly."""
+    def _git(*argv):
+        try:
+            completed = subprocess.run(
+                ["git", *argv],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return completed.stdout if completed.returncode == 0 else None
+
+    head = _git("rev-parse", "HEAD")
+    porcelain = _git("status", "--porcelain")
+    return {
+        "commit": head.strip() if head else None,
+        "dirty": bool(porcelain and porcelain.strip()),
+    }
+
+
+def record_result(result, entries: dict, **save_kwargs) -> dict:
+    """Fold one drained result into the seeded entries, saving its image."""
+    identity = candidate_identity(result)
+    if identity is None:
+        print(
+            "WARNING: result has no usable 'filename'; it cannot be matched to a "
+            "requested candidate.",
+            file=sys.stderr,
+        )
+        return {}
+
+    entry = entries.setdefault(
+        identity,
+        {
+            "identity": identity,
+            "status": "missing",
+            "image_path": None,
+            "dimensions": None,
+            "trace": None,
+            "error": None,
+        },
+    )
+
+    saved = save_result_images([result], **save_kwargs)
+    record = saved[0] if saved else {"image_path": None, "dimensions": None}
+
+    entry["image_path"] = record.get("image_path")
+    entry["dimensions"] = record.get("dimensions")
+    entry["trace"] = build_candidate_trace(result, save_kwargs.get("exp_mode", ""))
+    entry["status"] = "succeeded" if record.get("image_path") else "no_image"
+    return entry
+
+
+def record_failure(identity, entries: dict, error) -> dict:
+    """Fold a raised candidate into the entries without aborting the batch."""
+    identity = identity or "unidentified_candidate"
+    entry = entries.setdefault(
+        identity,
+        {
+            "identity": identity,
+            "status": "missing",
+            "image_path": None,
+            "dimensions": None,
+            "trace": None,
+            "error": None,
+        },
+    )
+    entry["status"] = "failed"
+    entry["error"] = str(error)
+    print(f"WARNING: candidate {identity} failed: {error}", file=sys.stderr)
+    return entry
+
+
+def build_retrieval_record(data_list) -> dict:
+    """Retrieval runs once per batch, so it is recorded once per run."""
+    first = data_list[0] if data_list else {}
+    references = first.get("top10_references") or []
+    examples = first.get("retrieved_examples") or []
+    return {
+        "setting": None,
+        "top10_references_count": len(references),
+        "retrieved_examples_count": len(examples),
+        "top10_references": scrub_payloads(references),
+    }
+
+
+def build_manifest(
+    *,
+    args,
+    additional_info: dict,
+    entries: dict,
+    content: str,
+    resolved_models: dict,
+    image_gen_backend: str,
+    retrieval: dict,
+    started_at: str,
+    finished_at: str,
+) -> dict:
+    """Assemble the run record from an explicit allowlist.
+
+    Credential material is excluded by construction rather than by filtering:
+    nothing is copied wholesale from args, config, or the result dicts.
+    """
+    content = content or ""
+    return {
+        "manifest_version": MANIFEST_VERSION,
+        "run": {
+            "status": run_status(entries),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "candidates_requested": len(entries),
+            "candidates_succeeded": sum(
+                1 for entry in entries.values() if entry.get("status") == "succeeded"
+            ),
+            "models": {
+                "main_model_name": resolved_models.get("main_model_name", ""),
+                "image_gen_model_name": resolved_models.get("image_gen_model_name", ""),
+            },
+            "image_gen_backend_derived": image_gen_backend,
+            "resolved_image_size": additional_info.get("image_size", ""),
+            "repository": repo_commit_record(),
+        },
+        "parameters": {
+            "task": getattr(args, "task", None),
+            "caption": getattr(args, "caption", None),
+            "output": getattr(args, "output", None),
+            "aspect_ratio": getattr(args, "aspect_ratio", None),
+            "figure_size": getattr(args, "figure_size", None),
+            "max_critic_rounds": getattr(args, "max_critic_rounds", None),
+            "num_candidates": getattr(args, "num_candidates", None),
+            "retrieval_setting": getattr(args, "retrieval_setting", None),
+            "planner_metaphor": getattr(args, "planner_metaphor", None),
+            "exp_mode": getattr(args, "exp_mode", None),
+            "main_model_name_requested": getattr(args, "main_model_name", None),
+            "image_gen_model_name_requested": getattr(args, "image_gen_model_name", None),
+            "additional_info": {
+                "rounded_ratio": additional_info.get("rounded_ratio", ""),
+                "figure_size": additional_info.get("figure_size", ""),
+                "image_size": additional_info.get("image_size", ""),
+            },
+        },
+        "input": {
+            "content_file": getattr(args, "content_file", None) or None,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "content_chars": len(content),
+            # Embedded rather than pinned by path: a --content-file that is later
+            # edited or moved would otherwise void reproducibility.
+            "content": content,
+        },
+        "retrieval": retrieval,
+        "candidates": [scrub_payloads(entry) for entry in entries.values()],
+    }
+
+
+def write_manifest(manifest_path: Path, manifest: dict) -> Path:
+    """The single emitter. Every exit path routes through here."""
+    manifest_path = Path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+@contextlib.contextmanager
+def quiet_pipeline_stdout():
+    """Send the pipeline's own print() chatter to stderr.
+
+    38 print() calls sit on the run path across paperviz_processor,
+    visualizer_agent and generation_utils. Without this the published
+    'stdout is image paths, one per line' contract is false.
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        yield
+
+
+def emit_results(entries: dict, manifest_path) -> None:
+    """Image paths to stdout, one per line. Manifest path to stderr."""
+    for entry in entries.values():
+        if entry.get("image_path"):
+            print(entry["image_path"])
+    if manifest_path is not None:
+        print(f"[manifest] {manifest_path}", file=sys.stderr)
+
+
 async def run(args):
     ensure_model_config()
     ensure_dataset(args.task)
@@ -331,7 +647,7 @@ async def run(args):
     from agents.retriever_agent import RetrieverAgent
     from agents.vanilla_agent import VanillaAgent
     from agents.polish_agent import PolishAgent
-    from utils import config
+    from utils import config, generation_utils
     from utils.paperviz_processor import PaperVizProcessor
 
     # Read content from file if --content-file is given
@@ -394,32 +710,60 @@ async def run(args):
             "max_critic_rounds": args.max_critic_rounds,
         })
 
-    # Process (parallel when multiple candidates)
-    results = []
-    async for result_data in processor.process_queries_batch(
-        data_list, max_concurrent=num_candidates, do_eval=False
-    ):
-        results.append(result_data)
+    # Seed one entry per *requested* candidate before draining anything, so a
+    # run that dies part-way is evaluated against what was asked for.
+    entries = seed_manifest_entries(data_list)
+    save_kwargs = {
+        "exp_mode": exp_mode,
+        "output_path": output_path,
+        "num_candidates": num_candidates,
+        "output_explicit": output_explicit,
+        "figure_size": args.figure_size,
+        "image_size": additional_info.get("image_size", ""),
+        "aspect_ratio": args.aspect_ratio,
+    }
 
-    if not results:
-        print("ERROR: Pipeline returned no results.", file=sys.stderr)
+    started_at = _utc_timestamp()
+    manifest_path = None
+    try:
+        # Pipeline chatter goes to stderr so stdout stays parseable.
+        with quiet_pipeline_stdout():
+            async for result_data in processor.process_queries_batch(
+                data_list, max_concurrent=num_candidates, do_eval=False
+            ):
+                record_result(result_data, entries, **save_kwargs)
+    finally:
+        # Single emitter, reached on every exit path.
+        manifest = build_manifest(
+            args=args,
+            additional_info=additional_info,
+            entries=entries,
+            content=content,
+            resolved_models={
+                "main_model_name": exp_config.main_model_name,
+                "image_gen_model_name": exp_config.image_gen_model_name,
+            },
+            image_gen_backend=derive_image_gen_backend(
+                exp_config.image_gen_model_name,
+                getattr(generation_utils, "openrouter_client", None),
+            ),
+            retrieval={
+                **build_retrieval_record(data_list),
+                "setting": args.retrieval_setting,
+            },
+            started_at=started_at,
+            finished_at=_utc_timestamp(),
+        )
+        manifest_path = write_manifest(manifest_path_for(output_path), manifest)
+
+    emit_results(entries, manifest_path)
+
+    if manifest["run"]["status"] == "failed":
+        print(
+            "ERROR: no candidate produced an image; see the manifest for details.",
+            file=sys.stderr,
+        )
         sys.exit(1)
-
-    # Save images, named from each candidate's own identity
-    saved = save_result_images(
-        results,
-        exp_mode=exp_mode,
-        output_path=output_path,
-        num_candidates=num_candidates,
-        output_explicit=output_explicit,
-        figure_size=args.figure_size,
-        image_size=additional_info.get("image_size", ""),
-        aspect_ratio=args.aspect_ratio,
-    )
-
-    for entry in saved:
-        if entry["image_path"]:
-            print(entry["image_path"])
 
 
 def build_parser() -> argparse.ArgumentParser:
