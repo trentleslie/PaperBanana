@@ -29,6 +29,22 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.legacy_generation_options import (  # noqa: E402
+    FIGURE_SIZE_TO_IMAGE_SIZE,
+    generation_additional_info,
+)
+
+FIGURE_SIZE_CHOICES = list(FIGURE_SIZE_TO_IMAGE_SIZE)
+
+
+def build_additional_info(args) -> dict:
+    """The per-candidate ``additional_info``, routed through the shared helper.
+
+    Kept as a named seam so the wiring can be tested. Building this dict inline
+    was the original defect: ``figure_size`` never reached the pipeline.
+    """
+    return generation_additional_info(args.aspect_ratio, args.figure_size)
+
 
 def ensure_model_config():
     """Copy model_config.template.yaml to model_config.yaml if missing."""
@@ -138,7 +154,7 @@ async def run(args):
             "caption": args.caption,
             "content": content,
             "visual_intent": args.caption,
-            "additional_info": {"rounded_ratio": args.aspect_ratio},
+            "additional_info": build_additional_info(args),
             "max_critic_rounds": args.max_critic_rounds,
         })
 
@@ -185,7 +201,8 @@ async def run(args):
         print(p)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from main() so it can be exercised in tests."""
     parser = argparse.ArgumentParser(
         description="PaperBanana Skill: generate academic diagrams/plots from text"
     )
@@ -203,6 +220,11 @@ def main():
     parser.add_argument("--aspect-ratio", type=str, default="21:9",
                         choices=["21:9", "16:9", "3:2"],
                         help="Aspect ratio (default: 21:9)")
+    parser.add_argument("--figure-size", type=str, default=None,
+                        choices=FIGURE_SIZE_CHOICES,
+                        help="Target figure width. Selects the provider image-size "
+                             "tier (see FIGURE_SIZE_TO_IMAGE_SIZE). Omitted, the "
+                             "provider default applies, as before.")
     parser.add_argument("--max-critic-rounds", type=int, default=3,
                         help="Max critic refinement rounds (default: 3)")
     parser.add_argument("--num-candidates", type=int, default=10,
@@ -220,7 +242,11 @@ def main():
                         choices=["demo_full", "demo_planner_critic"],
                         help="Pipeline mode: demo_full (Retriever+Planner+Stylist+Visualizer+Critic) or demo_planner_critic (Retriever+Planner+Visualizer+Critic, no Stylist) (default: demo_full)")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     asyncio.run(run(args))
 
 
