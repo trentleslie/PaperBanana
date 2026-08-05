@@ -28,7 +28,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -205,6 +207,28 @@ def ensure_model_config():
 
 
 @contextlib.contextmanager
+def _env_override(**overrides):
+    """Set environment variables for the duration of the block, then restore.
+
+    Used to disable Xet for the archive fetch. Xet moves the transfer into a
+    Rust HTTP stack that does not consult Python's ``socket.getaddrinfo``, so
+    ``ipv4_only_dns`` below cannot reach it and the transfer would take the
+    blackholed IPv6 route the workaround exists to avoid. Restoring matters:
+    the setting must not leak into the provider calls that follow.
+    """
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextlib.contextmanager
 def ipv4_only_dns():
     """Resolve names to A records only, for the duration of the block.
 
@@ -242,38 +266,93 @@ def ipv4_only_dns():
         socket.getaddrinfo = real_getaddrinfo
 
 
+DATASET_REPO = "dwzhu/PaperBananaBench"
+DATASET_ARCHIVE = "PaperBananaBench.zip"
+
+
+def dataset_task_dir(task_name: str) -> Path:
+    return PROJECT_ROOT / "data" / "PaperBananaBench" / task_name
+
+
+def dataset_present(task_name: str) -> bool:
+    """The same predicate acquisition short-circuits on and the Retriever reads.
+
+    ``RetrieverAgent`` decides whether to downgrade to ``none`` by testing for
+    ``ref.json``, so this must stay the authority on 'is the data usable'.
+    """
+    task_dir = dataset_task_dir(task_name)
+    return (task_dir / "ref.json").exists() and (task_dir / "images").is_dir()
+
+
 def ensure_dataset(task_name: str):
-    """Download PaperBananaBench data from HuggingFace if not present locally."""
-    data_dir = PROJECT_ROOT / "data" / "PaperBananaBench" / task_name
-    ref_path = data_dir / "ref.json"
-    images_dir = data_dir / "images"
-    if ref_path.exists() and images_dir.exists():
+    """Acquire PaperBananaBench from HuggingFace if it is not already present.
+
+    The dataset ships as a single ``PaperBananaBench.zip``, not as a per-task
+    directory tree. The previous implementation asked for ``allow_patterns=
+    ["<task>/*"]``, which matched zero files by construction, so the existence
+    check below could never be satisfied and every run re-attempted the fetch
+    while retrieval stayed permanently inert.
+
+    The archive's internal root is ``PaperBananaBench/``, so extracting it into
+    ``data/`` yields exactly the ``data/PaperBananaBench/<task>/ref.json`` and
+    ``.../images/`` layout the Retriever and Planner already expect, and each
+    entry's ``path_to_gt_image`` resolves relative to its task directory
+    unchanged.
+    """
+    if dataset_present(task_name):
         return
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download
     except ImportError:
         print("ERROR: huggingface_hub is required for automatic dataset download.\n"
               "Install it with: pip install huggingface_hub", file=sys.stderr)
         sys.exit(1)
+
+    data_root = PROJECT_ROOT / "data"
     # Status, not output: stdout belongs to the image paths alone.
-    print(f"Downloading PaperBananaBench/{task_name} from HuggingFace...",
+    print(f"Acquiring {DATASET_ARCHIVE} from HuggingFace (~266MB, one time)...",
           file=sys.stderr)
     # Timed, and reported from a finally, because this call has previously taken
     # ~18 minutes and *succeeded*, which is indistinguishable from a hang unless
     # something says how long it took. The failure path needs the number most.
     started = time.monotonic()
     try:
-        with ipv4_only_dns() as forced:
-            if forced:
-                print("[dataset] resolving IPv4-only (this host's IPv6 route to "
-                      "huggingface.co blackholes); PAPERBANANA_ACQUIRE_IPV4=0 to opt out.",
-                      file=sys.stderr)
-            snapshot_download(
-                "dwzhu/PaperBananaBench",
-                repo_type="dataset",
-                allow_patterns=[f"{task_name}/*"],
-                local_dir=str(PROJECT_ROOT / "data" / "PaperBananaBench"),
-            )
+        with tempfile.TemporaryDirectory(dir=str(data_root.parent)) as staging:
+            staging = Path(staging)
+            # Xet routes the transfer through a Rust HTTP stack that does not
+            # honour a patched socket.getaddrinfo, so the IPv4 forcing below
+            # would not reach it. Disabled for the duration of the fetch only.
+            with _env_override(HF_HUB_DISABLE_XET="1"), ipv4_only_dns() as forced:
+                if forced:
+                    print("[dataset] resolving IPv4-only (this host's IPv6 route to "
+                          "huggingface.co blackholes); PAPERBANANA_ACQUIRE_IPV4=0 to opt out.",
+                          file=sys.stderr)
+                archive = hf_hub_download(
+                    DATASET_REPO,
+                    DATASET_ARCHIVE,
+                    repo_type="dataset",
+                    local_dir=str(staging),
+                )
+            # Extract into staging, then move into place, so an interrupted or
+            # corrupt extraction can never leave a tree that satisfies
+            # dataset_present() and silently poisons every later run.
+            extracted = staging / "extracted"
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(extracted)
+            source = extracted / "PaperBananaBench"
+            if not (source / task_name / "ref.json").exists():
+                raise RuntimeError(
+                    f"{DATASET_ARCHIVE} did not contain PaperBananaBench/{task_name}/ref.json; "
+                    "the archive layout has changed and ensure_dataset needs updating"
+                )
+            data_root.mkdir(parents=True, exist_ok=True)
+            destination = data_root / "PaperBananaBench"
+            for entry in source.iterdir():
+                target = destination / entry.name
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(entry), str(target))
     finally:
         elapsed = time.monotonic() - started
         print(f"[dataset] acquisition took {elapsed:.1f}s", file=sys.stderr)
@@ -1171,9 +1250,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-candidates", type=positive_int, default=10,
                         help="Number of parallel candidates to generate, at least 1 "
                              "(default: 10)")
-    parser.add_argument("--retrieval-setting", type=str, default="auto",
+    # Opt-in, deliberately, and diverging from the UI's default for now.
+    # Acquisition only started working in this slice, so nothing has yet shown
+    # that reference-driven generation produces better figures than the
+    # Planner/Stylist/Critic loop alone. Turning it on by default would add a
+    # ~200-candidate LLM call plus ~10 reference-image attachments per candidate
+    # to every agent-driven run before that question is answered. Flip to "auto"
+    # once the A/B settles it.
+    parser.add_argument("--retrieval-setting", type=str, default="none",
                         choices=["auto", "manual", "random", "none"],
-                        help="Retrieval mode: auto (VLM selects refs), manual, random, or none (default: auto)")
+                        help="Retrieval mode: auto (VLM selects refs), manual, random, or none (default: none, opt-in)")
     parser.add_argument("--planner-metaphor", action="store_true",
                         help="Enable diagram-only Planner visual-metaphor discovery before detailed description output")
     parser.add_argument("--main-model-name", type=str, default="",

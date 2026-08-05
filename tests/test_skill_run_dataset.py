@@ -17,6 +17,8 @@ here opens a socket.
 """
 
 import contextlib
+import zipfile
+import json
 import io
 import sys
 import tempfile
@@ -33,29 +35,50 @@ from tests.test_skill_run_entry_point import DOWNLOAD_BANNER, stubbed_pipeline
 
 
 class FakeHub:
-    """Stands in for ``huggingface_hub``. Records calls; never touches a socket."""
+    """Stands in for ``huggingface_hub``. Records calls; never touches a socket.
 
-    def __init__(self, *, side_effect=None, delay: float = 0.0) -> None:
+    Builds a real archive with the layout the live dataset actually has: an
+    inner ``PaperBananaBench/`` root containing ``<task>/ref.json`` and
+    ``<task>/images/``. The extraction path is the part most likely to break, so
+    the fake exercises it rather than stubbing it out.
+    """
+
+    def __init__(self, *, side_effect=None, delay: float = 0.0, archive_root="PaperBananaBench",
+                 tasks=("diagram", "plot")) -> None:
         self.calls: list[dict] = []
         self.side_effect = side_effect
         self.delay = delay
+        self.archive_root = archive_root
+        self.tasks = tasks
 
-    def snapshot_download(self, repo_id, **kwargs):
-        self.calls.append({"repo_id": repo_id, **kwargs})
+    def hf_hub_download(self, repo_id, filename, **kwargs):
+        self.calls.append({"repo_id": repo_id, "filename": filename, **kwargs})
         if self.delay:
             import time
 
             time.sleep(self.delay)
         if self.side_effect is not None:
             raise self.side_effect
-        return "/nonexistent/snapshot"
+
+        local_dir = Path(kwargs.get("local_dir") or tempfile.mkdtemp())
+        local_dir.mkdir(parents=True, exist_ok=True)
+        archive = local_dir / filename
+        with zipfile.ZipFile(archive, "w") as zf:
+            for task in self.tasks:
+                base = f"{self.archive_root}/{task}"
+                zf.writestr(
+                    f"{base}/ref.json",
+                    json.dumps([{"id": "x", "path_to_gt_image": "images/x.jpg"}]),
+                )
+                zf.writestr(f"{base}/images/x.jpg", b"not-a-real-jpeg")
+        return str(archive)
 
 
 @contextlib.contextmanager
 def fake_hub(**kwargs):
     hub = FakeHub(**kwargs)
     module = types.ModuleType("huggingface_hub")
-    module.snapshot_download = hub.snapshot_download
+    module.hf_hub_download = hub.hf_hub_download
     saved = sys.modules.get("huggingface_hub")
     sys.modules["huggingface_hub"] = module
     try:
@@ -247,11 +270,14 @@ class Ipv4WorkaroundTests(ScratchRootTestCase):
 
         observed: list[object] = []
 
-        def recording_download(repo_id, **kwargs):
+        recorder = FakeHub()
+
+        def recording_download(repo_id, filename, **kwargs):
             observed.append(socket.getaddrinfo)
+            return recorder.hf_hub_download(repo_id, filename, **kwargs)
 
         module = types.ModuleType("huggingface_hub")
-        module.snapshot_download = recording_download
+        module.hf_hub_download = recording_download
         with unittest.mock.patch.dict(sys.modules, {"huggingface_hub": module}):
             with project_root(self.tmp, dataset_present=False):
                 outer = socket.getaddrinfo
@@ -259,7 +285,7 @@ class Ipv4WorkaroundTests(ScratchRootTestCase):
 
         self.assertEqual(len(observed), 1)
         self.assertIsNot(
-            observed[0], outer, "snapshot_download ran with the default resolver"
+            observed[0], outer, "the archive fetch ran with the default resolver"
         )
         self.assertIs(socket.getaddrinfo, outer, "resolver was not restored")
         self.assertIn("resolving IPv4-only", err)
@@ -309,3 +335,108 @@ class GuardAtTheProcessLevelTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArchiveExtractionTests(ScratchRootTestCase):
+    """Slice D: the archive is the only thing HuggingFace actually serves.
+
+    ``allow_patterns=["<task>/*"]`` matched zero files because the dataset ships
+    one ``PaperBananaBench.zip`` whose internal root is ``PaperBananaBench/``.
+    Extracting it into ``data/`` yields the layout the Retriever and Planner
+    already expect, so these tests pin the layout, not just the download.
+    """
+
+    def test_extraction_produces_the_layout_the_retriever_reads(self) -> None:
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub():
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            task_dir = self.tmp / "data" / "PaperBananaBench" / "diagram"
+            self.assertTrue((task_dir / "ref.json").exists())
+            self.assertTrue((task_dir / "images").is_dir())
+            self.assertTrue(skill_run.dataset_present("diagram"))
+
+    def test_the_image_paths_in_ref_json_resolve_where_the_planner_looks(self) -> None:
+        """PlannerAgent opens <task>/<path_to_gt_image> with no guard."""
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub():
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            task_dir = self.tmp / "data" / "PaperBananaBench" / "diagram"
+            entries = json.loads((task_dir / "ref.json").read_text(encoding="utf-8"))
+            for entry in entries:
+                self.assertTrue((task_dir / entry["path_to_gt_image"]).exists())
+
+    def test_a_second_run_makes_no_network_call(self) -> None:
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub() as first:
+                self.capture(skill_run.ensure_dataset, "diagram")
+            self.assertEqual(len(first.calls), 1)
+
+            with fake_hub() as second:
+                self.capture(skill_run.ensure_dataset, "diagram")
+            self.assertEqual(second.calls, [], "already-present short-circuit failed")
+
+    def test_an_unexpected_archive_layout_raises_instead_of_half_landing(self) -> None:
+        """A changed archive root must not leave a tree that looks acquired."""
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub(archive_root="SomethingElse"):
+                with self.assertRaises(RuntimeError):
+                    self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertFalse(
+                skill_run.dataset_present("diagram"),
+                "a failed acquisition satisfied the existence check",
+            )
+
+    def test_a_failed_download_leaves_nothing_that_satisfies_the_check(self) -> None:
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub(side_effect=RuntimeError("network died")):
+                with self.assertRaises(RuntimeError):
+                    self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertFalse(skill_run.dataset_present("diagram"))
+
+
+class XetOverrideTests(ScratchRootTestCase):
+    """Xet moves the transfer into a Rust stack the IPv4 patch cannot reach."""
+
+    def test_xet_is_disabled_during_the_fetch_and_restored_after(self) -> None:
+        seen = []
+
+        recorder = FakeHub()
+
+        def observing_download(repo_id, filename, **kwargs):
+            seen.append(skill_run.os.environ.get("HF_HUB_DISABLE_XET"))
+            return recorder.hf_hub_download(repo_id, filename, **kwargs)
+
+        module = types.ModuleType("huggingface_hub")
+        module.hf_hub_download = observing_download
+
+        with unittest.mock.patch.dict(skill_run.os.environ, {}, clear=False):
+            skill_run.os.environ.pop("HF_HUB_DISABLE_XET", None)
+            with unittest.mock.patch.dict(sys.modules, {"huggingface_hub": module}):
+                with project_root(self.tmp, dataset_present=False):
+                    self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertEqual(seen, ["1"], "Xet was not disabled for the transfer")
+            self.assertIsNone(
+                skill_run.os.environ.get("HF_HUB_DISABLE_XET"),
+                "the override leaked past the fetch into the provider calls",
+            )
+
+
+class DefaultRunCostTests(ScratchRootTestCase):
+    """Acquisition working must not silently make every run more expensive."""
+
+    def test_a_default_invocation_does_not_acquire_or_retrieve(self) -> None:
+        args = skill_run.build_parser().parse_args(
+            ["--content", "m", "--caption", "c"]
+        )
+
+        self.assertEqual(args.retrieval_setting, "none")
+        with unittest.mock.patch.object(skill_run, "ensure_dataset") as ensure:
+            attempted, _, _ = self.capture(skill_run.acquire_dataset, args)
+
+        ensure.assert_not_called()
+        self.assertFalse(attempted)
