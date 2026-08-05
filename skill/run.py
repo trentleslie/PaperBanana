@@ -22,6 +22,8 @@ import asyncio
 import base64
 import shutil
 import sys
+import tempfile
+import zipfile
 from io import BytesIO
 from pathlib import Path
 
@@ -39,26 +41,87 @@ def ensure_model_config():
         shutil.copy2(template_path, config_path)
 
 
+DATASET_REPO = "dwzhu/PaperBananaBench"
+DATASET_ARCHIVE = "PaperBananaBench.zip"
+DATASET_ROOT = "PaperBananaBench"
+
+
+def dataset_task_dir(task_name: str) -> Path:
+    return PROJECT_ROOT / "data" / DATASET_ROOT / task_name
+
+
+def task_dir_usable(task_dir: Path) -> bool:
+    """Whether an extracted task directory is complete enough to retrieve from.
+
+    One definition, shared by the download short-circuit and the extraction's
+    keep-or-replace decision. Two copies of this that must agree is how a
+    half-populated directory ends up surviving forever.
+    """
+    return (task_dir / "ref.json").exists() and (task_dir / "images").is_dir()
+
+
 def ensure_dataset(task_name: str):
-    """Download PaperBananaBench data from HuggingFace if not present locally."""
-    data_dir = PROJECT_ROOT / "data" / "PaperBananaBench" / task_name
-    ref_path = data_dir / "ref.json"
-    images_dir = data_dir / "images"
-    if ref_path.exists() and images_dir.exists():
+    """Download PaperBananaBench data from HuggingFace if not present locally.
+
+    The dataset is published as a single ``PaperBananaBench.zip``, not as a
+    per-task directory tree, so ``allow_patterns=["<task>/*"]`` matched no files
+    and nothing was ever downloaded. The archive's internal root is
+    ``PaperBananaBench/``, so extracting it into ``data/`` produces exactly the
+    ``data/PaperBananaBench/<task>/ref.json`` and ``.../images/`` layout the
+    Retriever and Planner already expect, with each entry's ``path_to_gt_image``
+    resolving relative to its task directory unchanged.
+    """
+    if task_dir_usable(dataset_task_dir(task_name)):
         return
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download
     except ImportError:
         print("ERROR: huggingface_hub is required for automatic dataset download.\n"
               "Install it with: pip install huggingface_hub", file=sys.stderr)
         sys.exit(1)
-    print(f"Downloading PaperBananaBench/{task_name} from HuggingFace...")
-    snapshot_download(
-        "dwzhu/PaperBananaBench",
-        repo_type="dataset",
-        allow_patterns=[f"{task_name}/*"],
-        local_dir=str(PROJECT_ROOT / "data" / "PaperBananaBench"),
-    )
+
+    data_root = PROJECT_ROOT / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {DATASET_ARCHIVE} from HuggingFace...")
+
+    with tempfile.TemporaryDirectory(dir=str(data_root)) as staging:
+        staging = Path(staging)
+        archive = hf_hub_download(
+            DATASET_REPO,
+            DATASET_ARCHIVE,
+            repo_type="dataset",
+            local_dir=str(staging / "download"),
+        )
+        # Extract into staging and move into place, so an interrupted or corrupt
+        # extraction cannot leave a tree that satisfies the presence check above
+        # and silently disables retrieval on every later run.
+        extracted = staging / "extracted"
+        with zipfile.ZipFile(archive) as archive_file:
+            archive_file.extractall(extracted)
+
+        source = extracted / DATASET_ROOT
+        if not (source / task_name / "ref.json").exists():
+            raise RuntimeError(
+                f"{DATASET_ARCHIVE} did not contain {DATASET_ROOT}/{task_name}/ref.json; "
+                "the archive layout has changed and ensure_dataset needs updating"
+            )
+
+        destination = data_root / DATASET_ROOT
+        superseded = staging / "superseded"
+        for entry in source.iterdir():
+            target = destination / entry.name
+            if target.exists():
+                # Keep what is already usable; replace what is not. Skipping on
+                # mere existence strands a half-populated task directory: it
+                # never satisfies task_dir_usable, so every later run downloads
+                # and extracts the archive again and then discards the complete
+                # copy it just produced.
+                if target.is_dir() and task_dir_usable(target):
+                    continue
+                superseded.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target), str(superseded / entry.name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(entry), str(target))
 
 
 def extract_final_image_b64(result: dict, exp_mode: str) -> str | None:
