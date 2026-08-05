@@ -191,6 +191,44 @@ def ensure_model_config():
         shutil.copy2(template_path, config_path)
 
 
+@contextlib.contextmanager
+def ipv4_only_dns():
+    """Resolve names to A records only, for the duration of the block.
+
+    ``huggingface.co`` publishes 8 AAAA records seen from this host and every one
+    of them blackholes: ``curl -6`` gets no response in 30s where ``curl -4``
+    returns 200 in 0.09s. A connect attempt carrying no per-attempt timeout
+    therefore burns the kernel's whole SYN-retry budget -- measured here at
+    136.3s for a single address -- before moving to the next. 8 x 136.3s = 1090s,
+    against the 1081s that ``run_20260804_084953`` spent inside ``ensure_dataset``
+    without transferring a byte. On a cold cache the same metadata call measures
+    24.5s dual-stack against 0.4s with IPv4 forced.
+
+    Deliberately scoped to the acquisition call rather than installed
+    process-wide: it is a workaround for one host's broken route, and the model
+    providers are reached from elsewhere. Nothing else is in flight at this point
+    in the run, so the temporary patch cannot race another request.
+
+    Set ``PAPERBANANA_ACQUIRE_IPV4=0`` to opt out.
+    """
+    if os.environ.get("PAPERBANANA_ACQUIRE_IPV4", "1") == "0":
+        yield False
+        return
+
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = ipv4_getaddrinfo
+    try:
+        yield True
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+
+
 def ensure_dataset(task_name: str):
     """Download PaperBananaBench data from HuggingFace if not present locally."""
     data_dir = PROJECT_ROOT / "data" / "PaperBananaBench" / task_name
@@ -207,12 +245,45 @@ def ensure_dataset(task_name: str):
     # Status, not output: stdout belongs to the image paths alone.
     print(f"Downloading PaperBananaBench/{task_name} from HuggingFace...",
           file=sys.stderr)
-    snapshot_download(
-        "dwzhu/PaperBananaBench",
-        repo_type="dataset",
-        allow_patterns=[f"{task_name}/*"],
-        local_dir=str(PROJECT_ROOT / "data" / "PaperBananaBench"),
-    )
+    # Timed, and reported from a finally, because this call has previously taken
+    # ~18 minutes and *succeeded*, which is indistinguishable from a hang unless
+    # something says how long it took. The failure path needs the number most.
+    started = time.monotonic()
+    try:
+        with ipv4_only_dns() as forced:
+            if forced:
+                print("[dataset] resolving IPv4-only (this host's IPv6 route to "
+                      "huggingface.co blackholes); PAPERBANANA_ACQUIRE_IPV4=0 to opt out.",
+                      file=sys.stderr)
+            snapshot_download(
+                "dwzhu/PaperBananaBench",
+                repo_type="dataset",
+                allow_patterns=[f"{task_name}/*"],
+                local_dir=str(PROJECT_ROOT / "data" / "PaperBananaBench"),
+            )
+    finally:
+        elapsed = time.monotonic() - started
+        print(f"[dataset] acquisition took {elapsed:.1f}s", file=sys.stderr)
+
+
+def acquire_dataset(args) -> bool:
+    """Acquire the benchmark dataset unless this run asked for no retrieval.
+
+    Keyed on the **requested** ``--retrieval-setting``, deliberately. The
+    *effective* mode is derived by ``RetrieverAgent`` from whether ``ref.json``
+    exists, which can only become true once acquisition has run; gating on it
+    would be circular and would permanently prevent the bootstrap. The requested
+    flag is the only signal available before acquisition that says whether this
+    run could ever benefit from the data.
+
+    Returns True when acquisition was attempted.
+    """
+    if getattr(args, "retrieval_setting", None) == "none":
+        print("[dataset] --retrieval-setting none: skipping dataset acquisition.",
+              file=sys.stderr)
+        return False
+    ensure_dataset(args.task)
+    return True
 
 
 def extract_final_image_b64(result: dict, exp_mode: str) -> str | None:
@@ -906,7 +977,8 @@ async def _execute_run(args, entries: dict, outcome: dict) -> None:
     # Only now pay for the dataset. On a first run this is a multi-hundred-MB
     # HuggingFace download, and SKILL.md promises an unusable --output fails in
     # seconds; ordering it after the preflight is what makes that promise true.
-    ensure_dataset(args.task)
+    # A run that requested no retrieval skips it outright and pays nothing.
+    acquire_dataset(args)
 
     # Late imports so env is ready. These are inside the redirect on purpose:
     # importing utils.generation_utils prints one 'Initialized <Provider> Client'
