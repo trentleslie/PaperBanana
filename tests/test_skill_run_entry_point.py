@@ -44,7 +44,7 @@ LATE_IMPORTS = {
 }
 
 IMPORT_BANNER = "Initialized Gemini Client with API Key"
-DOWNLOAD_BANNER = "Downloading PaperBananaBench/diagram from HuggingFace..."
+DOWNLOAD_BANNER = "Acquiring PaperBananaBench.zip from HuggingFace (~266MB, one time)..."
 CONFIG_WARNING = "Warning: main_model_name not configured, falling back to '...'."
 PIPELINE_CHATTER = "[Retriever] Running retrieval once for all candidates..."
 
@@ -443,15 +443,18 @@ class DatasetBannerTests(unittest.TestCase):
 
     def test_the_download_banner_goes_to_stderr(self) -> None:
         fake_hub = types.ModuleType("huggingface_hub")
-        fake_hub.snapshot_download = lambda *args, **kwargs: None
+        fake_hub.hf_hub_download = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("no network in tests")
+        )
 
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                skill_run.ensure_dataset("definitely_not_a_downloaded_task")
+                with contextlib.suppress(RuntimeError):
+                    skill_run.ensure_dataset("definitely_not_a_downloaded_task")
 
         self.assertEqual(out.getvalue(), "")
-        self.assertIn("Downloading PaperBananaBench/", err.getvalue())
+        self.assertIn("Acquiring PaperBananaBench.zip", err.getvalue())
 
 
 if __name__ == "__main__":
