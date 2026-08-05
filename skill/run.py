@@ -274,14 +274,23 @@ def dataset_task_dir(task_name: str) -> Path:
     return PROJECT_ROOT / "data" / "PaperBananaBench" / task_name
 
 
+def task_dir_usable(task_dir: Path) -> bool:
+    """Whether an extracted task directory is complete enough to retrieve from.
+
+    One definition, used by both the short-circuit and the extraction's
+    keep-or-replace decision. Two copies of this predicate that must agree is
+    exactly how a half-populated directory survives forever.
+    """
+    return (task_dir / "ref.json").exists() and (task_dir / "images").is_dir()
+
+
 def dataset_present(task_name: str) -> bool:
     """The same predicate acquisition short-circuits on and the Retriever reads.
 
     ``RetrieverAgent`` decides whether to downgrade to ``none`` by testing for
     ``ref.json``, so this must stay the authority on 'is the data usable'.
     """
-    task_dir = dataset_task_dir(task_name)
-    return (task_dir / "ref.json").exists() and (task_dir / "images").is_dir()
+    return task_dir_usable(dataset_task_dir(task_name))
 
 
 def ensure_dataset(task_name: str):
@@ -347,10 +356,21 @@ def ensure_dataset(task_name: str):
                 )
             data_root.mkdir(parents=True, exist_ok=True)
             destination = data_root / "PaperBananaBench"
+            # Keep what is already usable, replace what is not. Skipping on mere
+            # existence stranded a half-populated task directory permanently:
+            # dataset_present() stayed False, so every later run re-downloaded
+            # and re-extracted 266MB and then discarded the good copy it had just
+            # produced, in a loop that never converged.
+            superseded = staging / "superseded"
             for entry in source.iterdir():
                 target = destination / entry.name
                 if target.exists():
-                    continue
+                    if target.is_dir() and task_dir_usable(target):
+                        continue
+                    # Moved aside rather than deleted, so the previous contents
+                    # survive until the staging directory is torn down.
+                    superseded.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(target), str(superseded / entry.name))
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(entry), str(target))
     finally:

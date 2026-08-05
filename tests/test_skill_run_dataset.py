@@ -440,3 +440,85 @@ class DefaultRunCostTests(ScratchRootTestCase):
 
         ensure.assert_not_called()
         self.assertFalse(attempted)
+
+
+class IncompleteTaskDirectoryTests(ScratchRootTestCase):
+    """A half-populated task directory must be repaired, not stranded.
+
+    Skipping the move on mere existence left an incomplete directory in place
+    forever: ``dataset_present`` stayed False, so every later run re-downloaded
+    and re-extracted the 266MB archive and then discarded the good copy it had
+    just produced. A loop that never converged.
+    """
+
+    def partial(self, *, ref: bool, images: bool) -> Path:
+        task_dir = self.tmp / "data" / "PaperBananaBench" / "diagram"
+        task_dir.mkdir(parents=True)
+        if ref:
+            (task_dir / "ref.json").write_text("[]", encoding="utf-8")
+        if images:
+            (task_dir / "images").mkdir()
+        return task_dir
+
+    def test_a_task_dir_missing_images_is_repaired(self) -> None:
+        self.partial(ref=True, images=False)
+
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub():
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertTrue(
+                skill_run.dataset_present("diagram"),
+                "acquisition ran but left the dataset unusable",
+            )
+
+    def test_an_empty_task_dir_is_repaired(self) -> None:
+        self.partial(ref=False, images=False)
+
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub():
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertTrue(skill_run.dataset_present("diagram"))
+
+    def test_repairing_stops_the_endless_re_download(self) -> None:
+        """The symptom that makes this expensive rather than merely wrong."""
+        self.partial(ref=True, images=False)
+
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub() as first:
+                self.capture(skill_run.ensure_dataset, "diagram")
+            self.assertEqual(len(first.calls), 1)
+
+            with fake_hub() as again:
+                self.capture(skill_run.ensure_dataset, "diagram")
+            self.assertEqual(
+                again.calls, [], "a repaired dataset was downloaded a second time"
+            )
+
+    def test_an_already_complete_task_dir_is_left_alone(self) -> None:
+        """Repair must not clobber good data that is already there."""
+        task_dir = self.partial(ref=False, images=True)
+        (task_dir / "ref.json").write_text('["LOCAL"]', encoding="utf-8")
+
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub() as hub:
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertEqual(hub.calls, [], "a complete dataset triggered a download")
+            self.assertIn("LOCAL", (task_dir / "ref.json").read_text(encoding="utf-8"))
+
+    def test_a_sibling_task_is_not_disturbed_while_repairing_another(self) -> None:
+        base = self.tmp / "data" / "PaperBananaBench"
+        (base / "plot" / "images").mkdir(parents=True)
+        (base / "plot" / "ref.json").write_text('["PLOT-LOCAL"]', encoding="utf-8")
+        self.partial(ref=True, images=False)
+
+        with project_root(self.tmp, dataset_present=False):
+            with fake_hub():
+                self.capture(skill_run.ensure_dataset, "diagram")
+
+            self.assertTrue(skill_run.dataset_present("diagram"))
+            self.assertIn(
+                "PLOT-LOCAL", (base / "plot" / "ref.json").read_text(encoding="utf-8")
+            )
