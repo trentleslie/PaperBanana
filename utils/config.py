@@ -17,6 +17,7 @@ Configuration for experiments
 """
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,14 +67,17 @@ class ExpConfig:
         if not self.image_gen_model_name:
             self.image_gen_model_name = os.environ.get("IMAGE_GEN_MODEL_NAME", "")
         # Hard defaults so model name is never empty
+        # Warnings go to stderr: skill/run.py publishes stdout as image paths only.
         if not self.main_model_name:
             self.main_model_name = "gemini-3.1-pro-preview"
             print(f"Warning: main_model_name not configured, falling back to '{self.main_model_name}'. "
-                  "Set it in configs/model_config.yaml or via --main-model-name.")
+                  "Set it in configs/model_config.yaml or via --main-model-name.",
+                  file=sys.stderr)
         if not self.image_gen_model_name:
             self.image_gen_model_name = "gemini-3.1-flash-image-preview"
             print(f"Warning: image_gen_model_name not configured, falling back to '{self.image_gen_model_name}'. "
-                  "Set it in configs/model_config.yaml or via --image-gen-model-name.")
+                  "Set it in configs/model_config.yaml or via --image-gen-model-name.",
+                  file=sys.stderr)
         self.timestamp = (
             time.strftime("%m%d_%H%M") if self.timestamp is None else self.timestamp
         )

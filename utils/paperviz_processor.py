@@ -217,10 +217,46 @@ class PaperVizProcessor:
         all_result_list = []
         eval_dims = ["faithfulness", "conciseness", "readability", "aesthetics", "overall"]
 
+        reported_failures = set()
+
         with tqdm(total=len(tasks), desc="Processing concurrently",ascii=True) as pbar:
             # Iterate through completed tasks returned by as_completed
             for future in asyncio.as_completed(tasks):
-                result_data = await future
+                try:
+                    result_data = await future
+                except Exception as exc:
+                    # An unguarded await here closes this generator permanently,
+                    # cancelling every remaining task and discarding the whole
+                    # batch. Yield an explicit error record instead so one bad
+                    # candidate cannot destroy the rest of the run's work.
+                    failed_index = next(
+                        (
+                            index
+                            for index, task in enumerate(tasks)
+                            if index not in reported_failures
+                            and task.done()
+                            and not task.cancelled()
+                            and task.exception() is not None
+                        ),
+                        None,
+                    )
+                    if failed_index is None:
+                        identity, error = None, exc
+                    else:
+                        reported_failures.add(failed_index)
+                        identity = data_list[failed_index].get("filename")
+                        error = tasks[failed_index].exception()
+                    result_data = {
+                        "filename": identity,
+                        "candidate_error": f"{type(error).__name__}: {error}",
+                    }
+                    # The exception *type* only. The message is verbatim
+                    # third-party SDK text, and provider SDKs are known to echo
+                    # the key they were called with; printing it here would put
+                    # a live credential on the operator's log before the caller
+                    # ever gets the chance to redact it. The caller announces
+                    # the redacted detail (skill/run.py:record_failure).
+                    print(f"[Batch] Candidate {identity} failed: {type(error).__name__}")
                 all_result_list.append(result_data)
                 postfix_dict = {}
 
