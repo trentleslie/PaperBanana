@@ -19,6 +19,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from skill import run as skill_run
+from utils.legacy_ui_results import BASE64_SUFFIX
 
 from tests.test_skill_run_candidate_identity import png_b64
 
@@ -159,17 +160,18 @@ class TraceTests(unittest.TestCase):
         for stage in trace:
             for key, value in stage.items():
                 self.assertFalse(
-                    key.endswith(skill_run.BASE64_SUFFIX),
-                    f"base64 key survived: {key}",
-                )
-                self.assertFalse(
                     skill_run.looks_like_base64_payload(value),
                     f"base64 payload survived under {key}",
                 )
 
+        # The pointer survives, the thing it points at does not. Asserted on the
+        # payload values rather than on the key names: the trace is built from
+        # this module's own field names, so a key-name assertion here could
+        # never have gone red.
         serialized = json.dumps(trace)
+        self.assertIn("image_key", trace[0])
         for key, value in result.items():
-            if key.endswith(skill_run.BASE64_SUFFIX):
+            if key.endswith(BASE64_SUFFIX):
                 self.assertNotIn(value, serialized)
 
     def test_payload_hidden_under_a_text_field_name_is_elided(self) -> None:
@@ -189,6 +191,33 @@ class TraceTests(unittest.TestCase):
         self.assertFalse(skill_run.looks_like_base64_payload("Make the arrows thinner."))
         self.assertFalse(skill_run.looks_like_base64_payload(None))
         self.assertFalse(skill_run.looks_like_base64_payload(42))
+
+    def test_the_length_floor_is_what_saves_short_single_words(self) -> None:
+        """Pins BASE64_VALUE_MIN_LENGTH on its own.
+
+        Every other short string in these tests contains a space or a period, so
+        the character allowlist rejects it and the floor could be deleted with
+        the suite still green. These are the manifest's own vocabulary: pure
+        letters and digits, no separator, and short. Only the floor keeps them.
+        """
+        for word in ("succeeded", "complete", "Planner", "4k", "gemini"):
+            self.assertIsNotNone(
+                skill_run._BASE64_VALUE_RE.match(word),
+                f"{word!r} must be allowlist-clean, or the floor goes untested",
+            )
+            self.assertFalse(skill_run.looks_like_base64_payload(word))
+
+    def test_a_short_data_uri_is_still_a_payload(self) -> None:
+        """Pins the data-URI prefix on its own.
+
+        A data URI is punctuated and far under the length floor, so both other
+        conditions reject it; without the prefix check an inlined image would
+        reach the manifest verbatim.
+        """
+        data_uri = "data:image/png;base64," + png_b64()
+        self.assertLess(len(data_uri), skill_run.BASE64_VALUE_MIN_LENGTH)
+
+        self.assertTrue(skill_run.looks_like_base64_payload(data_uri))
 
     def test_long_punctuation_free_prose_survives_the_scrub(self) -> None:
         """The elision must not destroy the reasoning it sits next to.
@@ -474,10 +503,6 @@ class ManifestBuildTests(unittest.TestCase):
         def assert_no_payload(node, where="manifest"):
             if isinstance(node, dict):
                 for key, value in node.items():
-                    self.assertFalse(
-                        isinstance(key, str) and key.endswith(skill_run.BASE64_SUFFIX),
-                        f"base64 key survived at {where}.{key}",
-                    )
                     assert_no_payload(value, f"{where}.{key}")
             elif isinstance(node, list):
                 for index, value in enumerate(node):
@@ -758,6 +783,55 @@ class ErrorTextRedactionTests(unittest.TestCase):
             (configs / "model_config.yaml").write_text("{[not: yaml", encoding="utf-8")
             with unittest.mock.patch.object(skill_run, "PROJECT_ROOT", Path(tmp)):
                 self.assertEqual(skill_run.redact_credentials("plain error"), "plain error")
+
+    def test_a_payload_echoed_back_in_an_error_is_elided_from_the_manifest(self) -> None:
+        """The live call site for the scrub over the manifest entries.
+
+        Everything else in an entry is written by this module: statuses, paths,
+        dimensions, and a trace that build_candidate_trace already scrubbed.
+        ``error`` is the one field whose content comes from a third-party SDK,
+        and providers do echo the image they rejected. Without the scrub in
+        build_manifest that payload is stored verbatim in a record meant to be
+        kept indefinitely.
+        """
+        # Deterministic, not os.urandom: this blob is the one that goes through
+        # redact_credentials, and 200KB of random base64 has a ~1.6% chance of
+        # containing a literal "AIza". _KEY_SHAPED_RE would then punch a
+        # "<redacted: credential>" into the middle of it, the result would no
+        # longer look like a payload, and this test would fail one run in sixty
+        # for a reason that has nothing to do with what it asserts.
+        blob = ("PaperBananaRejectedImageBytes" * 9_000)[:200_000]
+        self.assertIsNone(skill_run._KEY_SHAPED_RE.search(blob))
+        self.assertTrue(skill_run.looks_like_base64_payload(blob))
+
+        entries = skill_run.seed_manifest_entries([{"filename": "skill_candidate_0"}])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            skill_run.record_failure(
+                "skill_candidate_0",
+                entries,
+                RuntimeError(blob),
+            )
+
+        # The entry itself still holds it; only the manifest view is scrubbed.
+        self.assertIn(blob, entries["skill_candidate_0"]["error"])
+
+        manifest = skill_run.build_manifest(
+            args=args_namespace(num_candidates=1),
+            additional_info={},
+            entries=entries,
+            candidates_requested=1,
+            content="method text",
+            resolved_models={},
+            image_gen_backend="gemini",
+            retrieval={},
+            started_at="2026-08-04T10:15:00Z",
+            finished_at="2026-08-04T10:38:00Z",
+        )
+
+        serialized = json.dumps(manifest)
+        self.assertNotIn(blob, serialized)
+        self.assertIn(skill_run.ELIDED_PAYLOAD, serialized)
 
     def test_ordinary_error_text_is_left_alone(self) -> None:
         self.assertEqual(
