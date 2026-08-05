@@ -41,8 +41,10 @@ from utils.legacy_generation_options import (  # noqa: E402
     FIGURE_SIZE_TO_IMAGE_SIZE,
     generation_additional_info,
 )
-from utils.legacy_ui_results import BASE64_SUFFIX  # noqa: E402
-
+from utils.retrieval_provenance import (  # noqa: E402
+    EFFECTIVE_RETRIEVAL_KEY,
+    RETRIEVAL_NOT_ATTEMPTED,
+)
 FIGURE_SIZE_CHOICES = list(FIGURE_SIZE_TO_IMAGE_SIZE)
 DEFAULT_FIGURE_SIZE = "14-17cm"
 DEFAULT_ASPECT_RATIO = "16:9"
@@ -70,17 +72,28 @@ DEFAULT_OUTPUT_NAME = "output.png"
 
 # Run record. Written on every run, beside the images, sharing the output stem.
 MANIFEST_SUFFIX = ".manifest.json"
-MANIFEST_VERSION = 1
+# Bumped to 2 when retrieval.setting was replaced by requested_setting +
+# effective_setting. Version 1 manifests exist on disk with the old, mutually
+# incompatible layout, so a reader that keys on this number has to be able to
+# tell them apart. Bump this whenever a field is renamed or removed, not only
+# when one is added.
+MANIFEST_VERSION = 2
 ELIDED_PAYLOAD = "<elided: base64 image payload>"
 # Long enough that prose never trips it, short enough that no real payload slips
-# through: the smallest images the pipeline emits are several KB base64.
+# through: the smallest images the pipeline emits are several KB base64. It is
+# also what keeps this module's own short allowlisted words -- 'succeeded',
+# 'complete', a stage name -- out of the elision, since none of them contain a
+# space either.
 BASE64_VALUE_MIN_LENGTH = 512
-# Newlines are allowed because providers line-wrap base64; a space or a tab is
-# not, because that is the one character that separates payloads from prose.
-# Without that rule any long punctuation-free sentence was elided as a payload,
-# silently destroying real planner and critic reasoning text.
+# This character allowlist is the whole prose/payload discriminator. \r and \n
+# are in it because providers line-wrap base64; the space and the tab are
+# deliberately out of it, because that is what every stretch of prose has and no
+# payload does. Without that exclusion any long punctuation-free sentence was
+# elided as a payload, silently destroying real planner and critic reasoning
+# text. A separate `[ \t]` search used to sit in front of this regex and test
+# exactly the same condition, so neither half could be pinned on its own:
+# disabling either one left the other passing every test. One mechanism now.
 _BASE64_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]+$")
-_PROSE_SEPARATOR_RE = re.compile(r"[ \t]")
 
 # Candidate error strings are the one free-text channel into the manifest whose
 # content the allowlist does not control: they come verbatim from third-party SDK
@@ -478,7 +491,9 @@ def run_status(entries: dict) -> str:
 def looks_like_base64_payload(value) -> bool:
     """True for values that are image payloads rather than prose.
 
-    A key-name check alone would admit a blob stored under another name.
+    A key-name check alone would admit a blob stored under another name. Three
+    conditions decide it, and each is pinned by its own test: the data-URI
+    prefix, the length floor, and the character allowlist.
     """
     if not isinstance(value, str):
         return False
@@ -487,20 +502,22 @@ def looks_like_base64_payload(value) -> bool:
         return True
     if len(text) < BASE64_VALUE_MIN_LENGTH:
         return False
-    # Prose separates its words with spaces; base64 never does.
-    if _PROSE_SEPARATOR_RE.search(text):
-        return False
     return bool(_BASE64_VALUE_RE.match(text))
 
 
 def scrub_payloads(value):
-    """Drop base64-suffixed keys and elide payload-shaped values, recursively."""
+    """Elide payload-shaped values, recursively.
+
+    Shape of the value, not the name of the key. A key filter dropping every
+    ``*_base64_jpg`` entry used to sit in front of this, but nothing that reaches
+    here has ever carried such a key: the trace copies description text, the
+    retrieval record copies reference ids, and the manifest entries are built
+    from this module's own field names. It could not be made to fire and so
+    could not be tested, and the value check already covers the same ground for
+    a blob parked under any name at all.
+    """
     if isinstance(value, dict):
-        return {
-            key: scrub_payloads(item)
-            for key, item in value.items()
-            if not (isinstance(key, str) and key.endswith(BASE64_SUFFIX))
-        }
+        return {key: scrub_payloads(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [scrub_payloads(item) for item in value]
     if looks_like_base64_payload(value):
@@ -706,13 +723,34 @@ async def drain_batch(result_stream, entries: dict, **save_kwargs) -> None:
             )
 
 
-def build_retrieval_record(data_list, setting: str | None = None) -> dict:
-    """Retrieval runs once per batch, so it is recorded once per run."""
+def build_retrieval_record(data_list, requested_setting: str | None = None) -> dict:
+    """Retrieval runs once per batch, so it is recorded once per run.
+
+    Two settings, because they are two different facts. RetrieverAgent downgrades
+    auto/random/manual to none when the files those modes need are absent, so a
+    record carrying only the request asserted ``"auto"`` for runs that retrieved
+    nothing, and the only hint was a zero count that a genuine empty result would
+    also produce. The effective mode is read back off the data dict the Retriever
+    mutated, not re-derived here: re-deriving would test filesystem state at a
+    different moment than the decision it claims to describe.
+
+    ``data_list[0]`` is the dict the Retriever was handed; process_queries_batch
+    copies only the reference keys onto its siblings.
+
+    This is called from a ``finally``, so it also runs for a batch that died
+    before the Retriever was ever reached. That case reports NOT_ATTEMPTED. A
+    null would be indistinguishable from a serialization slip and ``"none"``
+    would claim retrieval ran and deliberately chose nothing.
+    """
     first = data_list[0] if data_list else {}
+    effective = first.get(EFFECTIVE_RETRIEVAL_KEY)
+    if not isinstance(effective, str) or not effective:
+        effective = RETRIEVAL_NOT_ATTEMPTED
     references = first.get("top10_references") or []
     examples = first.get("retrieved_examples") or []
     return {
-        "setting": setting,
+        "requested_setting": requested_setting,
+        "effective_setting": effective,
         "top10_references_count": len(references),
         "retrieved_examples_count": len(examples),
         "top10_references": scrub_payloads(references),
@@ -737,7 +775,10 @@ def build_manifest(
     Credential material is excluded by construction rather than by filtering:
     nothing is copied wholesale from args, config, or the result dicts. The one
     exception is ``candidates[].error``, third-party text this module does not
-    author, which is redacted on the way in.
+    author. It is redacted for credential material on the way in, and it is the
+    reason the entries are scrubbed again here: a provider that echoes the image
+    it rejected puts a payload into that field, and nothing upstream of this
+    point looks at it.
 
     ``candidates_requested`` is passed in rather than read off ``entries``:
     ``record_failure`` can add an entry for a failure that could not be attributed
