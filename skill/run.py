@@ -41,6 +41,10 @@ from utils.legacy_generation_options import (  # noqa: E402
     FIGURE_SIZE_TO_IMAGE_SIZE,
     generation_additional_info,
 )
+from utils.retrieval_provenance import (  # noqa: E402
+    EFFECTIVE_RETRIEVAL_KEY,
+    RETRIEVAL_NOT_ATTEMPTED,
+)
 FIGURE_SIZE_CHOICES = list(FIGURE_SIZE_TO_IMAGE_SIZE)
 DEFAULT_FIGURE_SIZE = "14-17cm"
 DEFAULT_ASPECT_RATIO = "16:9"
@@ -643,13 +647,34 @@ async def drain_batch(result_stream, entries: dict, **save_kwargs) -> None:
             )
 
 
-def build_retrieval_record(data_list, setting: str | None = None) -> dict:
-    """Retrieval runs once per batch, so it is recorded once per run."""
+def build_retrieval_record(data_list, requested_setting: str | None = None) -> dict:
+    """Retrieval runs once per batch, so it is recorded once per run.
+
+    Two settings, because they are two different facts. RetrieverAgent downgrades
+    auto/random/manual to none when the files those modes need are absent, so a
+    record carrying only the request asserted ``"auto"`` for runs that retrieved
+    nothing, and the only hint was a zero count that a genuine empty result would
+    also produce. The effective mode is read back off the data dict the Retriever
+    mutated, not re-derived here: re-deriving would test filesystem state at a
+    different moment than the decision it claims to describe.
+
+    ``data_list[0]`` is the dict the Retriever was handed; process_queries_batch
+    copies only the reference keys onto its siblings.
+
+    This is called from a ``finally``, so it also runs for a batch that died
+    before the Retriever was ever reached. That case reports NOT_ATTEMPTED. A
+    null would be indistinguishable from a serialization slip and ``"none"``
+    would claim retrieval ran and deliberately chose nothing.
+    """
     first = data_list[0] if data_list else {}
+    effective = first.get(EFFECTIVE_RETRIEVAL_KEY)
+    if not isinstance(effective, str) or not effective:
+        effective = RETRIEVAL_NOT_ATTEMPTED
     references = first.get("top10_references") or []
     examples = first.get("retrieved_examples") or []
     return {
-        "setting": setting,
+        "requested_setting": requested_setting,
+        "effective_setting": effective,
         "top10_references_count": len(references),
         "retrieved_examples_count": len(examples),
         "top10_references": scrub_payloads(references),

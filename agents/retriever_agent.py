@@ -24,6 +24,7 @@ import base64, io, asyncio
 from PIL import Image
 
 from utils import generation_utils
+from utils.retrieval_provenance import EFFECTIVE_RETRIEVAL_KEY
 from .base_agent import BaseAgent
 
 
@@ -69,7 +70,12 @@ class RetrieverAgent(BaseAgent):
             retrieval_setting: One of 'auto', 'manual', 'random', 'none'
         
         Returns:
-            data: Updated data dictionary with 'top10_references' as List[str]
+            data: Updated data dictionary with 'top10_references' as List[str],
+                and EFFECTIVE_RETRIEVAL_KEY naming the setting actually used.
+                That is not always the one requested: a missing reference file
+                downgrades auto/random/manual to none here, and the caller must
+                be able to read what happened rather than re-derive it from
+                filesystem state at some later moment.
         """
         cfg = self.task_config
         
@@ -109,7 +115,11 @@ class RetrieverAgent(BaseAgent):
             data["retrieved_examples"] = []  # Planner will load from ref.json
         else:
             raise ValueError(f"Unknown retrieval_setting: {retrieval_setting}")
-        
+
+        # Set after the dispatch, not before: an unknown setting raises above and
+        # must not leave a claim behind about a mode nothing ever ran in.
+        data[EFFECTIVE_RETRIEVAL_KEY] = retrieval_setting
+
         return data
     
     def _load_manual_references(self, cfg: dict) -> tuple:

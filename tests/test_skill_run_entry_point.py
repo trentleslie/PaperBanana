@@ -24,6 +24,10 @@ import unittest.mock
 from pathlib import Path
 
 from skill import run as skill_run
+from utils.retrieval_provenance import (
+    EFFECTIVE_RETRIEVAL_KEY,
+    RETRIEVAL_NOT_ATTEMPTED,
+)
 
 from tests.test_skill_run_manifest import args_namespace, full_result
 
@@ -252,15 +256,73 @@ class RunEntryPointTests(unittest.IsolatedAsyncioTestCase):
         async def batch(data_list):
             data_list[0]["top10_references"] = [{"paper": "a"}, {"paper": "b"}]
             data_list[0]["retrieved_examples"] = [{"image": "x"}]
+            data_list[0][EFFECTIVE_RETRIEVAL_KEY] = "auto"
             for data in data_list:
                 yield full_result(data["filename"])
 
         await self.execute(batch, self.args(num_candidates=1, retrieval_setting="auto"))
 
         retrieval = self.manifest()["retrieval"]
-        self.assertEqual(retrieval["setting"], "auto")
+        self.assertEqual(retrieval["requested_setting"], "auto")
+        self.assertEqual(retrieval["effective_setting"], "auto")
         self.assertEqual(retrieval["top10_references_count"], 2)
         self.assertEqual(retrieval["retrieved_examples_count"], 1)
+
+    async def test_a_downgraded_retrieval_is_recorded_as_downgraded(self) -> None:
+        """The manifest can no longer assert 'auto' for a run that retrieved nothing.
+
+        RetrieverAgent falls back to 'none' when the reference file is absent,
+        which is what every run on this machine has actually done. Requested and
+        effective have to differ in the record, not merely be inferable from a
+        zero count that a genuine empty result would also produce.
+        """
+
+        async def batch(data_list):
+            data_list[0]["top10_references"] = []
+            data_list[0]["retrieved_examples"] = []
+            data_list[0][EFFECTIVE_RETRIEVAL_KEY] = "none"
+            for data in data_list:
+                yield full_result(data["filename"])
+
+        await self.execute(batch, self.args(num_candidates=1, retrieval_setting="auto"))
+
+        retrieval = self.manifest()["retrieval"]
+        self.assertEqual(retrieval["requested_setting"], "auto")
+        self.assertEqual(retrieval["effective_setting"], "none")
+        self.assertNotEqual(
+            retrieval["requested_setting"], retrieval["effective_setting"]
+        )
+        self.assertEqual(retrieval["top10_references_count"], 0)
+
+    async def test_a_batch_that_dies_before_retrieval_records_not_attempted(self) -> None:
+        """build_retrieval_record runs from a finally, so it runs for this too.
+
+        Nothing ever set an effective mode here. That must serialize as its own
+        state: a null reads as a bug in the writer, and 'none' would claim
+        retrieval ran and deliberately selected nothing.
+        """
+
+        async def batch(data_list):
+            raise RuntimeError("died before the Retriever was reached")
+            yield  # pragma: no cover - generator marker
+
+        out, err = io.StringIO(), io.StringIO()
+        with stubbed_pipeline(batch):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(RuntimeError):
+                    await skill_run.run(self.args(num_candidates=1))
+
+        retrieval = self.manifest()["retrieval"]
+        self.assertEqual(retrieval["effective_setting"], RETRIEVAL_NOT_ATTEMPTED)
+        self.assertIsNotNone(retrieval["effective_setting"])
+        self.assertNotEqual(retrieval["effective_setting"], "none")
+        # The request is still on record; only the outcome is unknown.
+        self.assertEqual(retrieval["requested_setting"], "auto")
+        # And it survives serialization as that state, not as a null.
+        self.assertIn(
+            f'"effective_setting": "{RETRIEVAL_NOT_ATTEMPTED}"',
+            (self.tmp / "figure.manifest.json").read_text(encoding="utf-8"),
+        )
 
 
     async def test_content_file_is_read_and_embedded_in_the_manifest(self) -> None:

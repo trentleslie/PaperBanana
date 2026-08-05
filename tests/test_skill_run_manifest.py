@@ -20,6 +20,10 @@ from pathlib import Path
 
 from skill import run as skill_run
 from utils.legacy_ui_results import BASE64_SUFFIX
+from utils.retrieval_provenance import (
+    EFFECTIVE_RETRIEVAL_KEY,
+    RETRIEVAL_NOT_ATTEMPTED,
+)
 
 from tests.test_skill_run_candidate_identity import png_b64
 
@@ -847,30 +851,76 @@ class RetrievalRecordTests(unittest.TestCase):
     place; with --num-candidates 1 there is nothing else it could read.
     """
 
-    def test_it_records_the_setting_and_the_shared_retrieval_result(self) -> None:
+    def test_it_records_both_settings_and_the_shared_retrieval_result(self) -> None:
         data_list = [
             {"filename": "skill_candidate_0",
              "top10_references": [{"paper": "a"}, {"paper": "b"}],
-             "retrieved_examples": [{"image": "x"}]},
+             "retrieved_examples": [{"image": "x"}],
+             EFFECTIVE_RETRIEVAL_KEY: "auto"},
             {"filename": "skill_candidate_1"},
         ]
 
         record = skill_run.build_retrieval_record(data_list, "auto")
 
-        self.assertEqual(record["setting"], "auto")
+        self.assertEqual(record["requested_setting"], "auto")
+        self.assertEqual(record["effective_setting"], "auto")
         self.assertEqual(record["top10_references_count"], 2)
         self.assertEqual(record["retrieved_examples_count"], 1)
         self.assertEqual(record["top10_references"], [{"paper": "a"}, {"paper": "b"}])
 
-    def test_retrieval_disabled_is_recorded_as_such_rather_than_omitted(self) -> None:
-        record = skill_run.build_retrieval_record([{"filename": "skill_candidate_0"}], "none")
+    def test_a_downgrade_shows_up_as_two_different_settings(self) -> None:
+        """The whole point: requested auto, ran as none, and the record says so."""
+        data_list = [{
+            "filename": "skill_candidate_0",
+            "top10_references": [],
+            "retrieved_examples": [],
+            EFFECTIVE_RETRIEVAL_KEY: "none",
+        }]
 
-        self.assertEqual(record["setting"], "none")
+        record = skill_run.build_retrieval_record(data_list, "auto")
+
+        self.assertEqual(record["requested_setting"], "auto")
+        self.assertEqual(record["effective_setting"], "none")
+
+    def test_retrieval_disabled_is_recorded_as_such_rather_than_omitted(self) -> None:
+        record = skill_run.build_retrieval_record(
+            [{"filename": "skill_candidate_0", EFFECTIVE_RETRIEVAL_KEY: "none"}], "none"
+        )
+
+        self.assertEqual(record["requested_setting"], "none")
+        self.assertEqual(record["effective_setting"], "none")
         self.assertEqual(record["top10_references_count"], 0)
         self.assertEqual(record["retrieved_examples_count"], 0)
 
+    def test_an_absent_effective_mode_is_not_attempted_rather_than_none(self) -> None:
+        """build_retrieval_record is called from a finally block.
+
+        A batch that raised before the Retriever ran leaves no effective mode at
+        all. Serializing that as null, or letting it default to 'none', both
+        claim something the run never established.
+        """
+        record = skill_run.build_retrieval_record([{"filename": "skill_candidate_0"}], "auto")
+
+        self.assertEqual(record["effective_setting"], RETRIEVAL_NOT_ATTEMPTED)
+        self.assertIsNotNone(record["effective_setting"])
+        self.assertNotEqual(record["effective_setting"], "none")
+        self.assertIn(
+            f'"effective_setting": "{RETRIEVAL_NOT_ATTEMPTED}"', json.dumps(record, indent=2)
+        )
+
+    def test_a_junk_effective_mode_is_treated_as_not_attempted(self) -> None:
+        """Nothing but a non-empty string is a claim about what retrieval did."""
+        for junk in (None, "", 0, [], {"mode": "auto"}):
+            record = skill_run.build_retrieval_record(
+                [{EFFECTIVE_RETRIEVAL_KEY: junk}], "auto"
+            )
+            self.assertEqual(record["effective_setting"], RETRIEVAL_NOT_ATTEMPTED)
+
     def test_an_empty_data_list_does_not_raise(self) -> None:
-        self.assertEqual(skill_run.build_retrieval_record([], "auto")["setting"], "auto")
+        record = skill_run.build_retrieval_record([], "auto")
+
+        self.assertEqual(record["requested_setting"], "auto")
+        self.assertEqual(record["effective_setting"], RETRIEVAL_NOT_ATTEMPTED)
 
     def test_a_payload_smuggled_into_a_reference_is_elided(self) -> None:
         blob = long_base64_blob()
@@ -879,6 +929,108 @@ class RetrievalRecordTests(unittest.TestCase):
         )
 
         self.assertNotIn(blob, json.dumps(record))
+
+
+class RetrieverEffectiveModeTests(unittest.IsolatedAsyncioTestCase):
+    """The seam: what RetrieverAgent writes is what build_retrieval_record reads.
+
+    Driven through the real agent rather than a hand-set key, because the whole
+    finding was that run.py re-derived a decision the agent had already made.
+    Offline: every path exercised here is one the agent takes *without* calling a
+    model, which is the same reason the fallback exists.
+    """
+
+    def make_agent(self, work_dir: Path):
+        from agents.retriever_agent import RetrieverAgent
+        from utils.config import ExpConfig
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            exp_config = ExpConfig(
+                dataset_name="Demo",
+                split_name="demo",
+                exp_mode="demo_full",
+                main_model_name="stub-model",
+                image_gen_model_name="stub-image-model",
+                work_dir=work_dir,
+            )
+            return RetrieverAgent(exp_config=exp_config)
+
+    async def run_agent(self, requested: str, *, ref_json: list | None = None) -> dict:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        if ref_json is not None:
+            ref_dir = tmp / "data" / "PaperBananaBench" / "diagram"
+            ref_dir.mkdir(parents=True)
+            (ref_dir / "ref.json").write_text(json.dumps(ref_json), encoding="utf-8")
+
+        agent = self.make_agent(tmp)
+        data = {"filename": "skill_candidate_0", "content": "method text",
+                "visual_intent": "Figure 1"}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return await agent.process(data, retrieval_setting=requested)
+
+    async def test_a_missing_reference_file_downgrades_auto_and_the_manifest_says_so(self) -> None:
+        data = await self.run_agent("auto")
+
+        record = skill_run.build_retrieval_record([data], "auto")
+
+        self.assertEqual(record["requested_setting"], "auto")
+        self.assertEqual(record["effective_setting"], "none")
+        self.assertEqual(record["top10_references_count"], 0)
+
+    async def test_random_with_references_present_stays_random(self) -> None:
+        """The mode is honoured when the file it needs exists, and 'random' is
+        the one mode that reads ref.json without any model call."""
+        data = await self.run_agent(
+            "random",
+            ref_json=[{"id": f"ref_{i}", "visual_intent": "x", "content": "y"}
+                      for i in range(12)],
+        )
+
+        record = skill_run.build_retrieval_record([data], "random")
+
+        self.assertEqual(record["effective_setting"], "random")
+        self.assertEqual(record["top10_references_count"], 10)
+
+    async def test_requested_none_records_none(self) -> None:
+        data = await self.run_agent("none")
+
+        record = skill_run.build_retrieval_record([data], "none")
+
+        self.assertEqual(record["requested_setting"], "none")
+        self.assertEqual(record["effective_setting"], "none")
+
+    async def test_an_effective_none_never_reports_references(self) -> None:
+        """A manifest that says retrieval did not happen cannot also show a count.
+
+        Asserted across every mode that downgrades, so the invariant holds for
+        the reason the reader will rely on it and not by coincidence.
+        """
+        for requested in ("auto", "random", "manual"):
+            with self.subTest(requested=requested):
+                data = await self.run_agent(requested)
+                record = skill_run.build_retrieval_record([data], requested)
+
+                self.assertEqual(record["effective_setting"], "none")
+                self.assertEqual(record["top10_references_count"], 0)
+                self.assertEqual(record["retrieved_examples_count"], 0)
+
+    async def test_an_unknown_setting_leaves_no_claim_behind(self) -> None:
+        """The agent raises; nothing must be recorded as the mode it ran in."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        agent = self.make_agent(tmp)
+        data = {"filename": "skill_candidate_0"}
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(ValueError):
+                await agent.process(data, retrieval_setting="sideways")
+
+        self.assertNotIn(EFFECTIVE_RETRIEVAL_KEY, data)
+        self.assertEqual(
+            skill_run.build_retrieval_record([data], "sideways")["effective_setting"],
+            RETRIEVAL_NOT_ATTEMPTED,
+        )
 
 
 class StdoutContractTests(unittest.TestCase):
