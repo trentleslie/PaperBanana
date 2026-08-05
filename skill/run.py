@@ -72,7 +72,12 @@ DEFAULT_OUTPUT_NAME = "output.png"
 
 # Run record. Written on every run, beside the images, sharing the output stem.
 MANIFEST_SUFFIX = ".manifest.json"
-MANIFEST_VERSION = 1
+# Bumped to 2 when retrieval.setting was replaced by requested_setting +
+# effective_setting. Version 1 manifests exist on disk with the old, mutually
+# incompatible layout, so a reader that keys on this number has to be able to
+# tell them apart. Bump this whenever a field is renamed or removed, not only
+# when one is added.
+MANIFEST_VERSION = 2
 ELIDED_PAYLOAD = "<elided: base64 image payload>"
 # Long enough that prose never trips it, short enough that no real payload slips
 # through: the smallest images the pipeline emits are several KB base64. It is

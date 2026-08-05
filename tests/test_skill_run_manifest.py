@@ -1077,5 +1077,58 @@ class StdoutContractTests(unittest.TestCase):
         self.assertIn(str(manifest_path), err.getvalue())
 
 
+class ManifestVersionContractTests(unittest.TestCase):
+    """The declared version has to move when the layout stops being compatible.
+
+    Version 1 manifests exist on disk carrying ``retrieval.setting``. This change
+    replaced that field, so a reader keying on the version number needs the two
+    layouts to be distinguishable. These tests couple the number to the shape, so
+    renaming a field without bumping the version fails rather than shipping a
+    manifest that misdeclares itself.
+    """
+
+    def test_the_retrieval_layout_and_the_declared_version_move_together(self) -> None:
+        record = skill_run.build_retrieval_record([{}], "auto")
+
+        self.assertEqual(
+            set(record),
+            {
+                "requested_setting",
+                "effective_setting",
+                "top10_references_count",
+                "retrieved_examples_count",
+                "top10_references",
+            },
+            "retrieval layout changed; bump MANIFEST_VERSION and update this test",
+        )
+        self.assertEqual(
+            skill_run.MANIFEST_VERSION,
+            2,
+            "the retrieval layout above is the version-2 shape",
+        )
+
+    def test_the_replaced_field_is_gone_rather_than_kept_alongside(self) -> None:
+        """Keeping `setting` would preserve the ambiguity the change removes."""
+        record = skill_run.build_retrieval_record([{}], "auto")
+
+        self.assertNotIn("setting", record)
+
+    def test_an_emitted_manifest_declares_the_current_version(self) -> None:
+        manifest = skill_run.build_manifest(
+            args=args_namespace(num_candidates=1),
+            additional_info={"rounded_ratio": "16:9"},
+            entries={},
+            candidates_requested=1,
+            content="method text",
+            resolved_models={"main_model_name": "m", "image_gen_model_name": "i"},
+            image_gen_backend="gemini",
+            retrieval=skill_run.build_retrieval_record([{}], "auto"),
+            started_at="2026-08-04T10:15:00Z",
+            finished_at="2026-08-04T10:38:00Z",
+        )
+
+        self.assertEqual(manifest["manifest_version"], skill_run.MANIFEST_VERSION)
+
+
 if __name__ == "__main__":
     unittest.main()
